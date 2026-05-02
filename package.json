@@ -1,0 +1,15 @@
+{
+  "name": "glm-coding-plan-checkout",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CLI that creates a GLM Coding Pro monthly recurring checkout link without paying.",
+  "scripts": {
+    "buy:glm-coding": "node src/cli.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {}
+}
