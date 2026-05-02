@@ -6,6 +6,8 @@
   "description": "CLI that creates a GLM Coding Pro monthly recurring checkout link without paying.",
   "scripts": {
     "buy:glm-coding": "node src/cli.js",
+    "install:browsers": "playwright install chromium",
+    "setup": "npm install && npm run install:browsers",
     "test": "node --test"
   },
   "dependencies": {
