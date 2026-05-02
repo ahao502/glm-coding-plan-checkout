@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 import { STATUSES } from './constants.js';
-import { runBrowserFlow } from './browser-flow.js';
+import { runScheduledCheckout } from './scheduler.js';
 import { failure, printJson } from './result.js';
 
 try {
-  const result = await runBrowserFlow();
+  const result = await runScheduledCheckout();
   printJson(result);
   process.exitCode = result.status === STATUSES.CHECKOUT_READY ? 0 : 1;
 } catch (error) {

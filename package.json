@@ -8,7 +8,8 @@
     "buy:glm-coding": "node src/cli.js",
     "install:browsers": "playwright install chromium",
     "setup": "npm install && npm run install:browsers",
-    "test": "node --test"
+    "test": "node --test",
+    "ui": "node src/ui-server.js"
   },
   "dependencies": {
     "playwright": "^1.52.0"
