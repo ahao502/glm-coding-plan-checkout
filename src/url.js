@@ -1,5 +1,6 @@
 const ALLOWED_CHECKOUT_HOSTS = new Set(['bigmodel.cn', 'www.bigmodel.cn']);
 const CHECKOUT_PATH_HINTS = /(checkout|cashier|pay|payment|order|purchase|subscribe|billing|trade)/i;
+const CHECKOUT_API_PATH_HINTS = /(order|trade|pay|checkout|purchase|subscribe|billing|plan|coding)/i;
 
 export function isAllowedCheckoutUrl(value) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -22,6 +23,16 @@ export function looksLikeCheckoutUrl(value) {
   const url = new URL(value);
   const haystack = `${url.pathname}${url.search}${url.hash}`;
   return CHECKOUT_PATH_HINTS.test(haystack);
+}
+
+export function isCheckoutApiUrl(value) {
+  if (!isAllowedCheckoutUrl(value)) {
+    return false;
+  }
+
+  const url = new URL(value);
+  const haystack = `${url.pathname}${url.search}${url.hash}`;
+  return CHECKOUT_API_PATH_HINTS.test(haystack);
 }
 
 export function absolutizeUrl(value, baseUrl = 'https://bigmodel.cn') {

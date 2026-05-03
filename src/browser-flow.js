@@ -7,7 +7,8 @@ import { GLM_CODING_URL, STATUSES, STORAGE_STATE_PATH } from './constants.js';
 import { classifyText, extractCheckoutCandidate } from './payload.js';
 import { checkoutReady, failure, outOfStock } from './result.js';
 import { formatDuration, formatLocalDateTime } from './time.js';
-import { isAllowedCheckoutUrl, looksLikeCheckoutUrl } from './url.js';
+import { isAllowedCheckoutUrl, isCheckoutApiUrl, looksLikeCheckoutUrl } from './url.js';
+import { buildRecipe, refreshDynamicTokens, replayRecipe, setupRequestCapture, shouldRefreshPage } from './api-capture.js';
 
 const ACTION_TEXT_RE = /(立即购买|购买|订阅|开通|升级|Buy|Subscribe|Purchase)/i;
 const MONTHLY_TEXT_RE = /(连续包月|自动续费|包月|monthly|recurring)/i;
@@ -47,20 +48,8 @@ async function ensureStorageState(browserType = chromium) {
   return STORAGE_STATE_PATH;
 }
 
-function sameSiteResponse(response) {
-  const url = new URL(response.url());
-  return url.hostname === 'bigmodel.cn' || url.hostname.endsWith('.bigmodel.cn');
-}
-
 function checkoutResponseCandidate(response) {
-  const req = response.request();
-  const method = req.method().toUpperCase();
-  const url = response.url();
-  return (
-    sameSiteResponse(response) &&
-    method !== 'GET' &&
-    /(order|trade|pay|checkout|purchase|subscribe|billing|plan|coding)/i.test(url)
-  );
+  return response.request().method().toUpperCase() !== 'GET' && isCheckoutApiUrl(response.url());
 }
 
 async function responseToJsonOrText(response) {
@@ -111,19 +100,25 @@ async function chooseMonthlyIfPresent(page) {
   }
 }
 
-async function clickProCheckoutAction(page) {
+async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = {}) {
   await chooseMonthlyIfPresent(page);
 
   const proText = page.getByText(PRO_TEXT_RE).first();
   if ((await proText.count()) === 0) {
-    return false;
+    return { clicked: false, fingerprint: null };
   }
 
-  const clicked = await page.evaluate(
-    ({ proSource, actionSource }) => {
+  const result = await page.evaluate(
+    ({ proSource, actionSource, skipFingerprint }) => {
       const proRe = new RegExp(proSource, 'i');
       const actionRe = new RegExp(actionSource, 'i');
       const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+      function fingerprint(el) {
+        const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+        const classes = Array.from(el.classList || []).sort().join('.');
+        return `${el.tagName.toLowerCase()}#${el.id || ''}.${classes}|${text}`;
+      }
 
       function visible(el) {
         const rect = el.getBoundingClientRect();
@@ -148,26 +143,31 @@ async function clickProCheckoutAction(page) {
         return 0;
       }
 
-      const target = candidates
-        .map((el) => ({ el, score: score(el) }))
+      const scored = candidates
+        .map((el) => ({ el, score: score(el), fp: fingerprint(el) }))
         .filter((item) => item.score > 0)
-        .sort((a, b) => b.score - a.score)[0]?.el;
+        .sort((a, b) => b.score - a.score);
 
-      if (!target) {
-        return false;
+      const best = skipFingerprint
+        ? scored.find((item) => item.fp !== skipFingerprint)
+        : scored[0];
+
+      if (!best) {
+        return { clicked: false, fingerprint: null };
       }
 
-      target.scrollIntoView({ block: 'center', inline: 'center' });
-      target.click();
-      return true;
+      best.el.scrollIntoView({ block: 'center', inline: 'center' });
+      best.el.click();
+      return { clicked: true, fingerprint: best.fp };
     },
     {
       proSource: PRO_TEXT_RE.source,
-      actionSource: ACTION_TEXT_RE.source
+      actionSource: ACTION_TEXT_RE.source,
+      skipFingerprint: lastClickedFingerprint
     }
   );
 
-  return clicked;
+  return result;
 }
 
 async function currentPageCheckoutUrl(page) {
@@ -203,23 +203,32 @@ async function pageRequiresLogin(page) {
   return /(请先登录|未登录|登录后|login\s+required|please\s+log\s+in)/i.test(body);
 }
 
+async function resetPageState(page) {
+  await page.reload({ waitUntil: 'networkidle' });
+  await chooseMonthlyIfPresent(page);
+}
+
 async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
   if (await pageRequiresLogin(page)) {
     return failure(STATUSES.LOGIN_REQUIRED);
   }
 
-  const responseResultPromise = page
-    .waitForResponse(checkoutResponseCandidate, { timeout: attemptSettleMs })
+  const responsePromise = page
+    .waitForResponse(checkoutResponseCandidate)
     .then((response) => captureCheckoutFromResponse(response, page.url()))
     .catch(() => null);
 
-  const clicked = await clickProCheckoutAction(page);
+  const { clicked } = await clickProCheckoutAction(page);
   if (!clicked) {
-    await responseResultPromise;
+    await Promise.race([responsePromise, defaultSleep(attemptSettleMs)]).catch(() => {});
     return failure(STATUSES.PLAN_NOT_FOUND);
   }
 
-  const responseResult = await responseResultPromise;
+  const responseResult = await Promise.race([
+    responsePromise,
+    defaultSleep(attemptSettleMs).then(() => null)
+  ]);
+
   const pageCheckout = await currentPageCheckoutUrl(page);
   if (pageCheckout) {
     return pageCheckout;
@@ -295,6 +304,35 @@ async function waitUntilWithCountdown({
   }
 }
 
+async function captureFirstCheckoutAttempt(page, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
+  const { captured, dispose } = await setupRequestCapture(page);
+
+  const responsePromise = page
+    .waitForResponse(checkoutResponseCandidate)
+    .then((r) => captureCheckoutFromResponse(r, page.url()))
+    .catch(() => null);
+
+  const { clicked } = await clickProCheckoutAction(page);
+
+  if (!clicked) {
+    dispose();
+    await Promise.race([responsePromise, defaultSleep(attemptSettleMs)]).catch(() => {});
+    return { recipe: null, responseResult: null, pageCheckout: null };
+  }
+
+  const responseResult = await Promise.race([
+    responsePromise,
+    defaultSleep(attemptSettleMs).then(() => null)
+  ]);
+
+  dispose();
+
+  const pageCheckout = await currentPageCheckoutUrl(page);
+  const recipe = buildRecipe(captured, pageCheckout);
+
+  return { recipe, responseResult, pageCheckout };
+}
+
 export async function runFastClickCheckout({
   browserType = chromium,
   startAt,
@@ -337,6 +375,8 @@ export async function runFastClickCheckout({
       });
     }
 
+    let recipe = null;
+
     while (attempts < maxAttempts && (!stopAt || now() < stopAt)) {
       if (signal?.aborted) {
         throw abortError();
@@ -346,18 +386,70 @@ export async function runFastClickCheckout({
       logOutput.write(`Attempt ${attempts} at ${formatLocalDateTime(now())}.\n`);
       onEvent?.({ type: 'attempt', attempts });
 
-      const result = await attemptCheckoutOnPage(page, { attemptSettleMs });
-      lastStatus = result.status;
+      let result;
+
+      if (recipe) {
+        if (shouldRefreshPage(attempts, recipe)) {
+          logOutput.write('Refreshing page to reset state.\n');
+          await resetPageState(page);
+          recipe = await refreshDynamicTokens(page, recipe);
+        }
+
+        logOutput.write(`Replaying captured ${recipe.type} recipe.\n`);
+        const replayResult = await replayRecipe(page, recipe);
+
+        if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
+          const candidate = extractCheckoutCandidate(replayResult.body, page.url());
+          if (candidate.checkoutUrl) {
+            result = checkoutReady(candidate);
+          }
+        }
+
+        if (!result) {
+          const pageCheckout = await currentPageCheckoutUrl(page);
+          if (pageCheckout) {
+            result = pageCheckout;
+          }
+        }
+
+        if (!result) {
+          logOutput.write('Recipe replay failed, falling back to DOM click.\n');
+          await resetPageState(page);
+          const { recipe: newRecipe, responseResult: rr, pageCheckout: pc } =
+            await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+          if (newRecipe) {
+            recipe = newRecipe;
+          }
+          result = pc || rr;
+          if (!result) {
+            result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+          }
+        }
+      } else {
+        logOutput.write('Capturing checkout request.\n');
+        const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
+          await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+
+        recipe = capturedRecipe;
+        result = pc || rr;
+
+        if (!result) {
+          logOutput.write('No API captured, falling back to DOM click.\n');
+          result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+        }
+      }
+
+      lastStatus = result?.status;
       onEvent?.({ type: 'result', result });
 
-      if (result.status === STATUSES.CHECKOUT_READY) {
+      if (result?.status === STATUSES.CHECKOUT_READY) {
         return {
           ...result,
           attempts
         };
       }
 
-      if (result.status === STATUSES.LOGIN_REQUIRED) {
+      if (result?.status === STATUSES.LOGIN_REQUIRED) {
         return {
           ...result,
           attempts
