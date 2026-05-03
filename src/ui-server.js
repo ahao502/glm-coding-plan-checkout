@@ -236,6 +236,34 @@ function html() {
     .failed, .login_required, .contract_changed { color: var(--danger); }
     .attempting, .countdown-state { color: var(--warning); }
 
+    .log-panel {
+      margin-top: 16px;
+    }
+
+    .log-list {
+      min-height: 120px;
+      max-height: 360px;
+      overflow: auto;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      background: #101828;
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log-entry {
+      padding: 1px 0;
+    }
+
+    .log-entry.info { color: #c0caf5; }
+    .log-entry.warn { color: #e0af68; }
+    .log-entry.error { color: #f7768e; }
+    .log-empty { color: #565f89; }
+
     @media (max-width: 760px) {
       header, .actions { flex-direction: column; align-items: stretch; }
       .layout, .form-grid, .metrics { grid-template-columns: 1fr; }
@@ -289,6 +317,11 @@ function html() {
         <pre id="result">{}</pre>
       </section>
     </div>
+
+    <section class="log-panel">
+      <h2 class="panel-title">请求日志</h2>
+      <div id="logList" class="log-list"><span class="log-empty">等待任务启动...</span></div>
+    </section>
   </main>
 
   <script>
@@ -302,6 +335,7 @@ function html() {
     const startAtText = document.querySelector('#startAtText');
     const stopAtText = document.querySelector('#stopAtText');
     const result = document.querySelector('#result');
+    const logList = document.querySelector('#logList');
 
     function duration(ms) {
       const total = Math.max(0, Math.ceil(Number(ms || 0) / 1000));
@@ -354,9 +388,32 @@ function html() {
       result.textContent = JSON.stringify(status.lastResult || {}, null, 2);
     }
 
+    let lastLogCount = 0;
+
+    function renderLogs(status) {
+      const logs = status.logs || [];
+      if (logs.length === 0) {
+        logList.innerHTML = '<span class="log-empty">等待任务启动...</span>';
+        lastLogCount = 0;
+        return;
+      }
+
+      if (logs.length === lastLogCount) return;
+      lastLogCount = logs.length;
+
+      const isAtBottom = logList.scrollHeight - logList.scrollTop - logList.clientHeight < 40;
+      logList.innerHTML = logs.map(l => {
+        const time = l.time ? new Date(l.time).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        return '<div class="log-entry ' + l.level + '">[' + time + '] ' + l.message + '</div>';
+      }).join('');
+      if (isAtBottom) logList.scrollTop = logList.scrollHeight;
+    }
+
     async function refresh() {
       try {
-        render(await api('/api/status'));
+        const status = await api('/api/status');
+        render(status);
+        renderLogs(status);
       } catch (error) {
         result.textContent = JSON.stringify({ error: error.message }, null, 2);
       }

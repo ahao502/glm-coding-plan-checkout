@@ -391,16 +391,36 @@ export async function runFastClickCheckout({
       if (recipe) {
         if (shouldRefreshPage(attempts, recipe)) {
           logOutput.write('Refreshing page to reset state.\n');
+          onEvent?.({ type: 'log', message: '刷新页面以重置状态，并刷新 token', level: 'info' });
           await resetPageState(page);
           recipe = await refreshDynamicTokens(page, recipe);
         }
 
+        const replayDetail = recipe.type === 'api'
+          ? `${recipe.method} ${recipe.url}`
+          : `导航到 ${recipe.url}`;
         logOutput.write(`Replaying captured ${recipe.type} recipe.\n`);
+        onEvent?.({ type: 'log', message: `重放 recipe: ${replayDetail}`, level: 'info' });
+
         const replayResult = await replayRecipe(page, recipe);
+
+        if (replayResult.error) {
+          onEvent?.({ type: 'log', message: `重放请求失败: ${replayResult.error}`, level: 'error' });
+        } else {
+          const bodyPreview = typeof replayResult.body === 'string'
+            ? replayResult.body.slice(0, 200)
+            : JSON.stringify(replayResult.body).slice(0, 200);
+          onEvent?.({
+            type: 'log',
+            message: `重放响应: HTTP ${replayResult.status}, body: ${bodyPreview}`,
+            level: replayResult.ok ? 'info' : 'warn'
+          });
+        }
 
         if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
           const candidate = extractCheckoutCandidate(replayResult.body, page.url());
           if (candidate.checkoutUrl) {
+            onEvent?.({ type: 'log', message: `从重放响应中提取到 checkout URL: ${candidate.checkoutUrl}`, level: 'info' });
             result = checkoutReady(candidate);
           }
         }
@@ -408,17 +428,20 @@ export async function runFastClickCheckout({
         if (!result) {
           const pageCheckout = await currentPageCheckoutUrl(page);
           if (pageCheckout) {
+            onEvent?.({ type: 'log', message: `页面导航到 checkout URL: ${pageCheckout.checkoutUrl}`, level: 'info' });
             result = pageCheckout;
           }
         }
 
         if (!result) {
           logOutput.write('Recipe replay failed, falling back to DOM click.\n');
+          onEvent?.({ type: 'log', message: '重放未生成 checkout，降级为 DOM 点击重试', level: 'warn' });
           await resetPageState(page);
           const { recipe: newRecipe, responseResult: rr, pageCheckout: pc } =
             await captureFirstCheckoutAttempt(page, { attemptSettleMs });
           if (newRecipe) {
             recipe = newRecipe;
+            onEvent?.({ type: 'log', message: `重新捕获到 recipe: ${newRecipe.type === 'api' ? `${newRecipe.method} ${newRecipe.url}` : `导航 ${newRecipe.url}`}`, level: 'info' });
           }
           result = pc || rr;
           if (!result) {
@@ -427,14 +450,29 @@ export async function runFastClickCheckout({
         }
       } else {
         logOutput.write('Capturing checkout request.\n');
+        onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：首次点击并捕获 checkout API 请求`, level: 'info' });
         const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
           await captureFirstCheckoutAttempt(page, { attemptSettleMs });
 
         recipe = capturedRecipe;
         result = pc || rr;
 
+        if (recipe) {
+          const detail = recipe.type === 'api'
+            ? `${recipe.method} ${recipe.url}`
+            : `导航 ${recipe.url}`;
+          onEvent?.({ type: 'log', message: `成功捕获 recipe: ${detail}`, level: 'info' });
+        } else {
+          onEvent?.({ type: 'log', message: '未捕获到 checkout API 请求，后续使用 DOM 点击模式', level: 'warn' });
+        }
+
+        if (result) {
+          onEvent?.({ type: 'log', message: `首次尝试结果: ${result.status}`, level: 'info' });
+        }
+
         if (!result) {
           logOutput.write('No API captured, falling back to DOM click.\n');
+          onEvent?.({ type: 'log', message: '降级为 DOM 点击重试', level: 'warn' });
           result = await attemptCheckoutOnPage(page, { attemptSettleMs });
         }
       }
@@ -443,6 +481,7 @@ export async function runFastClickCheckout({
       onEvent?.({ type: 'result', result });
 
       if (result?.status === STATUSES.CHECKOUT_READY) {
+        onEvent?.({ type: 'log', message: `抢购成功！checkout URL: ${result.checkoutUrl}`, level: 'info' });
         return {
           ...result,
           attempts
@@ -450,6 +489,7 @@ export async function runFastClickCheckout({
       }
 
       if (result?.status === STATUSES.LOGIN_REQUIRED) {
+        onEvent?.({ type: 'log', message: '登录态已过期，需要重新登录', level: 'error' });
         return {
           ...result,
           attempts

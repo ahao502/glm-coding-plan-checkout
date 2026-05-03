@@ -12,7 +12,8 @@ function stoppedResult() {
 function cloneStatus(status) {
   return {
     ...status,
-    lastResult: status.lastResult ? { ...status.lastResult } : null
+    lastResult: status.lastResult ? { ...status.lastResult } : null,
+    logs: status.logs ? [...status.logs] : []
   };
 }
 
@@ -37,7 +38,8 @@ export class CheckoutTaskManager {
       retryIntervalMs: DEFAULT_RETRY_INTERVAL_MS,
       timeRemainingMs: 0,
       attempts: 0,
-      lastResult: null
+      lastResult: null,
+      logs: []
     };
   }
 
@@ -82,7 +84,8 @@ export class CheckoutTaskManager {
       retryIntervalMs: safeRetryIntervalMs,
       timeRemainingMs: Math.max(0, resolvedStartAt.getTime() - this.now().getTime()),
       attempts: 0,
-      lastResult: null
+      lastResult: null,
+      logs: []
     };
 
     const promise = this.runCheckout({
@@ -163,6 +166,19 @@ export class CheckoutTaskManager {
 
     if (event.type === 'preparing') {
       this.status.status = 'preparing';
+      return;
+    }
+
+    if (event.type === 'log') {
+      const entry = {
+        time: this.now().toISOString(),
+        message: event.message || '',
+        level: event.level || 'info'
+      };
+      this.status.logs.push(entry);
+      if (this.status.logs.length > 200) {
+        this.status.logs = this.status.logs.slice(-200);
+      }
     }
   }
 }
