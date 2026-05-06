@@ -9,6 +9,7 @@ import { checkoutReady, failure, outOfStock } from './result.js';
 import { formatDuration, formatLocalDateTime } from './time.js';
 import { isAllowedCheckoutUrl, isCheckoutApiUrl, looksLikeCheckoutUrl } from './url.js';
 import { buildRecipe, refreshDynamicTokens, replayRecipe, setupRequestCapture, shouldRefreshPage } from './api-capture.js';
+import { buildRecipeFromDiscoveryArtifacts, recipeDetail } from './checkout-discovery.js';
 
 const ACTION_TEXT_RE = /(立即购买|购买|订阅|开通|升级|Buy|Subscribe|Purchase)/i;
 const MONTHLY_TEXT_RE = /(连续包月|自动续费|包月|monthly|recurring)/i;
@@ -126,9 +127,17 @@ async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = 
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       }
 
+      function disabled(el) {
+        return Boolean(
+          el.disabled ||
+          el.getAttribute('aria-disabled') === 'true' ||
+          el.closest('[disabled], [aria-disabled="true"]')
+        );
+      }
+
       function score(el) {
         const text = el.innerText || el.textContent || '';
-        if (!actionRe.test(text) || !visible(el)) {
+        if (!actionRe.test(text) || !visible(el) || disabled(el)) {
           return -1;
         }
 
@@ -192,6 +201,206 @@ async function currentPageCheckoutUrl(page) {
   }
 
   return null;
+}
+
+async function discoverCheckoutRecipeFromPage(page) {
+  await chooseMonthlyIfPresent(page);
+
+  const artifacts = await page.evaluate(
+    ({ proSource, actionSource }) => {
+      const proRe = new RegExp(proSource, 'i');
+      const actionRe = new RegExp(actionSource, 'i');
+      const controls = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+
+      function textOf(el) {
+        return (el.innerText || el.textContent || el.value || '').trim();
+      }
+
+      function visible(el) {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      }
+
+      function disabled(el) {
+        return Boolean(
+          el.disabled ||
+          el.getAttribute('aria-disabled') === 'true' ||
+          el.closest('[disabled], [aria-disabled="true"]')
+        );
+      }
+
+      function attrs(el, source) {
+        return Array.from(el.attributes || [], (attr) => ({
+          key: attr.name,
+          value: attr.value,
+          source
+        }));
+      }
+
+      function pushAttrs(values, el, source) {
+        values.push(...attrs(el, source));
+        const text = textOf(el);
+        if (text) {
+          values.push({ key: 'text', value: text, source });
+        }
+      }
+
+      function relevantControl(el) {
+        const text = textOf(el);
+        if (!actionRe.test(text) || !visible(el)) {
+          return false;
+        }
+
+        let current = el;
+        for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+          const containerText = current.innerText || current.textContent || '';
+          if (proRe.test(containerText)) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function nearestProContainer(el) {
+        let best = el;
+        for (let depth = 0, current = el; current && depth < 7; depth += 1, current = current.parentElement) {
+          const text = current.innerText || current.textContent || '';
+          if (proRe.test(text)) {
+            best = current;
+          }
+        }
+        return best;
+      }
+
+      const artifacts = [];
+      for (const control of controls.filter(relevantControl)) {
+        const values = [];
+        pushAttrs(values, control, disabled(control) ? 'disabled-control' : 'control');
+
+        let current = control.parentElement;
+        for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+          pushAttrs(values, current, 'ancestor');
+        }
+
+        const container = nearestProContainer(control);
+        const related = Array.from(container.querySelectorAll('a, button, form, input, [href], [action], [onclick], [data-url], [data-href], [data-api]')).slice(0, 80);
+        for (const el of related) {
+          pushAttrs(values, el, 'related');
+        }
+
+        const form = control.closest('form');
+        if (form) {
+          values.push({ key: 'formMethod', value: form.method || '', source: 'form' });
+          pushAttrs(values, form, 'form');
+          const params = new URLSearchParams(new FormData(form)).toString();
+          if (params) {
+            values.push({ key: 'formParams', value: params, source: 'form' });
+          }
+        }
+
+        artifacts.push({
+          disabled: disabled(control),
+          method: control.getAttribute('method') || control.dataset?.method || null,
+          formMethod: form?.method || null,
+          values
+        });
+      }
+
+      const scriptTexts = Array.from(document.scripts)
+        .map((script) => script.textContent || '')
+        .filter((text) => /checkout|cashier|pay|payment|order|purchase|subscribe|billing|trade/i.test(text))
+        .slice(0, 10)
+        .map((text) => text.slice(0, 20_000));
+
+      if (artifacts.length > 0 && scriptTexts.length > 0) {
+        artifacts.push({
+          disabled: false,
+          method: null,
+          formMethod: null,
+          values: scriptTexts.map((value) => ({ key: 'script', value, source: 'script' }))
+        });
+      }
+
+      return artifacts;
+    },
+    {
+      proSource: PRO_TEXT_RE.source,
+      actionSource: ACTION_TEXT_RE.source
+    }
+  );
+
+  return buildRecipeFromDiscoveryArtifacts(artifacts, page.url());
+}
+
+async function attemptDiscoveredRecipe(page, recipe, onEvent) {
+  const detail = recipeDetail(recipe);
+  onEvent?.({
+    type: 'log',
+    message: recipe.type === 'api' ? `尝试官方 API: ${detail}` : `打开解析到的购买页面: ${detail}`,
+    level: 'info'
+  });
+
+  const replayResult = await replayRecipe(page, recipe);
+  if (replayResult.error) {
+    onEvent?.({ type: 'log', message: `官方入口触发失败: ${replayResult.error}`, level: 'error' });
+    return null;
+  }
+
+  const bodyText = typeof replayResult.body === 'string' ? replayResult.body : JSON.stringify(replayResult.body);
+  const bodyPreview = bodyText.slice(0, 200);
+  onEvent?.({
+    type: 'log',
+    message: `官方入口响应: HTTP ${replayResult.status}, body: ${bodyPreview}`,
+    level: replayResult.ok ? 'info' : 'warn'
+  });
+
+  const textStatus = classifyText(bodyText);
+  if (textStatus === 'out_of_stock') {
+    onEvent?.({ type: 'log', message: '服务端返回库存不足/未开放', level: 'warn' });
+    return outOfStock();
+  }
+
+  if (textStatus === 'login_required' || replayResult.status === 401 || replayResult.status === 403) {
+    onEvent?.({ type: 'log', message: '服务端返回需要登录或无权限', level: 'error' });
+    return failure(STATUSES.LOGIN_REQUIRED);
+  }
+
+  if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
+    const candidate = extractCheckoutCandidate(replayResult.body, page.url());
+    if (candidate.checkoutUrl) {
+      onEvent?.({ type: 'log', message: `成功解析 checkoutUrl: ${candidate.checkoutUrl}`, level: 'info' });
+      return checkoutReady(candidate);
+    }
+  }
+
+  const pageCheckout = await currentPageCheckoutUrl(page);
+  if (pageCheckout) {
+    onEvent?.({ type: 'log', message: `页面导航到 checkout URL: ${pageCheckout.checkoutUrl}`, level: 'info' });
+    return pageCheckout;
+  }
+
+  if (!replayResult.ok) {
+    onEvent?.({ type: 'log', message: `服务端拒绝官方入口: HTTP ${replayResult.status}`, level: 'warn' });
+  }
+
+  return null;
+}
+
+async function discoverAndAttemptCheckoutRecipe(page, onEvent) {
+  const discoveredRecipe = await discoverCheckoutRecipeFromPage(page);
+  if (!discoveredRecipe) {
+    return { recipe: null, result: null };
+  }
+
+  onEvent?.({
+    type: 'log',
+    message: `解析到灰色按钮入口: ${recipeDetail(discoveredRecipe)}`,
+    level: 'info'
+  });
+
+  const result = await attemptDiscoveredRecipe(page, discoveredRecipe, onEvent);
+  return { recipe: discoveredRecipe, result };
 }
 
 async function pageRequiresLogin(page) {
@@ -402,28 +611,7 @@ export async function runFastClickCheckout({
         logOutput.write(`Replaying captured ${recipe.type} recipe.\n`);
         onEvent?.({ type: 'log', message: `重放 recipe: ${replayDetail}`, level: 'info' });
 
-        const replayResult = await replayRecipe(page, recipe);
-
-        if (replayResult.error) {
-          onEvent?.({ type: 'log', message: `重放请求失败: ${replayResult.error}`, level: 'error' });
-        } else {
-          const bodyPreview = typeof replayResult.body === 'string'
-            ? replayResult.body.slice(0, 200)
-            : JSON.stringify(replayResult.body).slice(0, 200);
-          onEvent?.({
-            type: 'log',
-            message: `重放响应: HTTP ${replayResult.status}, body: ${bodyPreview}`,
-            level: replayResult.ok ? 'info' : 'warn'
-          });
-        }
-
-        if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
-          const candidate = extractCheckoutCandidate(replayResult.body, page.url());
-          if (candidate.checkoutUrl) {
-            onEvent?.({ type: 'log', message: `从重放响应中提取到 checkout URL: ${candidate.checkoutUrl}`, level: 'info' });
-            result = checkoutReady(candidate);
-          }
-        }
+        result = await attemptDiscoveredRecipe(page, recipe, onEvent);
 
         if (!result) {
           const pageCheckout = await currentPageCheckoutUrl(page);
@@ -435,33 +623,47 @@ export async function runFastClickCheckout({
 
         if (!result) {
           logOutput.write('Recipe replay failed, falling back to DOM click.\n');
-          onEvent?.({ type: 'log', message: '重放未生成 checkout，降级为 DOM 点击重试', level: 'warn' });
+          onEvent?.({ type: 'log', message: '重放未生成 checkout，重新扫描灰色按钮入口', level: 'warn' });
           await resetPageState(page);
-          const { recipe: newRecipe, responseResult: rr, pageCheckout: pc } =
-            await captureFirstCheckoutAttempt(page, { attemptSettleMs });
-          if (newRecipe) {
-            recipe = newRecipe;
-            onEvent?.({ type: 'log', message: `重新捕获到 recipe: ${newRecipe.type === 'api' ? `${newRecipe.method} ${newRecipe.url}` : `导航 ${newRecipe.url}`}`, level: 'info' });
+          const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
+          if (discovery.recipe) {
+            recipe = discovery.recipe;
           }
-          result = pc || rr;
           if (!result) {
-            result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+            result = discovery.result;
+          }
+          if (!result) {
+            onEvent?.({ type: 'log', message: '灰色按钮入口仍未生成 checkout，降级为 DOM 点击重试', level: 'warn' });
+            const { recipe: newRecipe, responseResult: rr, pageCheckout: pc } =
+              await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+            if (newRecipe) {
+              recipe = newRecipe;
+              onEvent?.({ type: 'log', message: `重新捕获到 recipe: ${newRecipe.type === 'api' ? `${newRecipe.method} ${newRecipe.url}` : `导航 ${newRecipe.url}`}`, level: 'info' });
+            }
+            result = pc || rr;
+            if (!result) {
+              result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+            }
           }
         }
       } else {
         logOutput.write('Capturing checkout request.\n');
-        onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：首次点击并捕获 checkout API 请求`, level: 'info' });
-        const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
-          await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+        onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：先扫描灰色按钮入口`, level: 'info' });
+        const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
+        recipe = discovery.recipe;
+        result = discovery.result;
 
-        recipe = capturedRecipe;
-        result = pc || rr;
+        if (!result) {
+          onEvent?.({ type: 'log', message: '未从灰色按钮入口生成 checkout，首次点击并捕获 checkout API 请求', level: 'warn' });
+          const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
+            await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+
+          recipe = recipe || capturedRecipe;
+          result = pc || rr;
+        }
 
         if (recipe) {
-          const detail = recipe.type === 'api'
-            ? `${recipe.method} ${recipe.url}`
-            : `导航 ${recipe.url}`;
-          onEvent?.({ type: 'log', message: `成功捕获 recipe: ${detail}`, level: 'info' });
+          onEvent?.({ type: 'log', message: `当前可复用 recipe: ${recipeDetail(recipe)}`, level: 'info' });
         } else {
           onEvent?.({ type: 'log', message: '未捕获到 checkout API 请求，后续使用 DOM 点击模式', level: 'warn' });
         }

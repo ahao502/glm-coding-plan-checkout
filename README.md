@@ -40,6 +40,21 @@ Open `http://127.0.0.1:3000`. The local page lets you choose the next execution 
 
 The command prints JSON to stdout. Progress and login prompts are written to stderr.
 
+## Logs
+
+Each CLI or Web UI task also writes structured JSONL logs to `.logs/glm-coding/YYYY-MM-DD.jsonl`.
+The directory is ignored by git. Each line is one event with fields such as `time`, `sessionId`,
+`eventType`, `status`, `attempts`, `message`, and `data`.
+
+Example:
+
+```json
+{"time":"2026-05-06T02:00:00.000Z","sessionId":"...","level":"info","eventType":"attempt","status":"attempting","attempts":1,"message":"Checkout attempt 1.","data":{"type":"attempt","attempts":1}}
+```
+
+Logs intentionally keep complete checkout URLs, API URLs, and response previews to help diagnose
+why a checkout was not created. Treat `.logs/` as sensitive local data.
+
 Successful output:
 
 ```json

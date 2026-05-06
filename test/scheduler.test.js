@@ -11,6 +11,16 @@ function silentOutput() {
   };
 }
 
+function memoryLogger(entries = []) {
+  return () => ({
+    sessionId: 'test-session',
+    write(entry) {
+      entries.push(entry);
+      return Promise.resolve();
+    }
+  });
+}
+
 test('passes the 10:00-10:05 window to a single long-lived runner', async () => {
   const current = new Date(2026, 0, 1, 9, 55, 0, 0);
   const calls = [];
@@ -21,7 +31,8 @@ test('passes the 10:00-10:05 window to a single long-lived runner', async () => 
       calls.push(options);
       return checkoutReady({ checkoutUrl: 'https://bigmodel.cn/pay/abc' });
     },
-    output: silentOutput()
+    output: silentOutput(),
+    createLogger: memoryLogger()
   });
 
   assert.equal(calls.length, 1);
@@ -70,7 +81,8 @@ test('uses an explicit retry interval override', async () => {
       return checkoutReady({ checkoutUrl: 'https://bigmodel.cn/pay/abc' });
     },
     output: silentOutput(),
-    retryIntervalMs: 250
+    retryIntervalMs: 250,
+    createLogger: memoryLogger()
   });
 
   assert.equal(receivedRetryIntervalMs, 250);
@@ -82,8 +94,33 @@ test('returns login-required failures from the long-lived runner', async () => {
   const result = await runScheduledCheckout({
     now: () => current,
     runCheckout: async () => failure(STATUSES.LOGIN_REQUIRED),
-    output: silentOutput()
+    output: silentOutput(),
+    createLogger: memoryLogger()
   });
 
   assert.equal(result.status, STATUSES.LOGIN_REQUIRED);
+});
+
+test('scheduled checkout writes JSONL lifecycle events through logger', async () => {
+  const current = new Date(2026, 4, 6, 9, 55, 0, 0);
+  const entries = [];
+
+  await runScheduledCheckout({
+    now: () => current,
+    runCheckout: async ({ onEvent }) => {
+      onEvent({ type: 'attempt', attempts: 1 });
+      onEvent({ type: 'result', result: checkoutReady({ checkoutUrl: 'https://bigmodel.cn/pay/abc' }) });
+      return checkoutReady({ checkoutUrl: 'https://bigmodel.cn/pay/abc' });
+    },
+    output: silentOutput(),
+    createLogger: memoryLogger(entries)
+  });
+
+  assert.deepEqual(entries.map((entry) => entry.eventType), [
+    'task_started',
+    'attempt',
+    'result',
+    'task_finished'
+  ]);
+  assert.equal(entries[2].data.checkoutUrl, 'https://bigmodel.cn/pay/abc');
 });

@@ -1,4 +1,4 @@
-const ALLOWED_CHECKOUT_HOSTS = new Set(['bigmodel.cn', 'www.bigmodel.cn']);
+const ALLOWED_CHECKOUT_HOSTS = new Set(['bigmodel.cn', 'www.bigmodel.cn', 'open.bigmodel.cn']);
 const CHECKOUT_PATH_HINTS = /(checkout|cashier|pay|payment|order|purchase|subscribe|billing|trade)/i;
 const CHECKOUT_API_PATH_HINTS = /(order|trade|pay|checkout|purchase|subscribe|billing|plan|coding)/i;
 

@@ -1,5 +1,6 @@
 import { DEFAULT_RETRY_INTERVAL_MS, nextCheckoutWindow } from './scheduler.js';
 import { runFastClickCheckout } from './browser-flow.js';
+import { createDailyJsonlLogger } from './file-logger.js';
 
 const WINDOW_DURATION_MS = 5 * 60 * 1000;
 
@@ -26,10 +27,12 @@ export function defaultStartAt(now = new Date()) {
 }
 
 export class CheckoutTaskManager {
-  constructor({ runCheckout = runFastClickCheckout, now = () => new Date() } = {}) {
+  constructor({ runCheckout = runFastClickCheckout, now = () => new Date(), createLogger = createDailyJsonlLogger } = {}) {
     this.runCheckout = runCheckout;
     this.now = now;
+    this.createLogger = createLogger;
     this.controller = null;
+    this.logger = null;
     this.status = {
       running: false,
       status: 'idle',
@@ -76,6 +79,7 @@ export class CheckoutTaskManager {
     const stopAt = stopAtForStart(resolvedStartAt);
     const controller = new AbortController();
     this.controller = controller;
+    this.logger = this.createLogger({ now: this.now });
     this.status = {
       running: true,
       status: 'preparing',
@@ -87,6 +91,14 @@ export class CheckoutTaskManager {
       lastResult: null,
       logs: []
     };
+    this.writeLogEvent('task_started', {
+      message: 'Checkout task started.',
+      data: {
+        startAt: resolvedStartAt.toISOString(),
+        stopAt: stopAt.toISOString(),
+        retryIntervalMs: safeRetryIntervalMs
+      }
+    });
 
     const promise = this.runCheckout({
       startAt: resolvedStartAt,
@@ -101,6 +113,12 @@ export class CheckoutTaskManager {
         this.status.status = result.status === 'checkout_ready' ? 'success' : result.status;
         this.status.lastResult = result;
         this.status.attempts = result.attempts ?? this.status.attempts;
+        this.writeLogEvent('task_finished', {
+          status: this.status.status,
+          attempts: this.status.attempts,
+          message: 'Checkout task finished.',
+          data: result
+        });
         return result;
       })
       .catch((error) => {
@@ -109,6 +127,13 @@ export class CheckoutTaskManager {
           const result = stoppedResult();
           this.status.status = 'stopped';
           this.status.lastResult = result;
+          this.writeLogEvent('task_stopped', {
+            level: 'warn',
+            status: this.status.status,
+            attempts: this.status.attempts,
+            message: 'Checkout task stopped.',
+            data: result
+          });
           return result;
         }
 
@@ -118,6 +143,13 @@ export class CheckoutTaskManager {
         };
         this.status.status = 'failed';
         this.status.lastResult = result;
+        this.writeLogEvent('task_failed', {
+          level: 'error',
+          status: this.status.status,
+          attempts: this.status.attempts,
+          message: result.message,
+          data: result
+        });
         return result;
       })
       .finally(() => {
@@ -149,6 +181,12 @@ export class CheckoutTaskManager {
     if (event.type === 'countdown') {
       this.status.status = 'countdown';
       this.status.timeRemainingMs = event.timeRemainingMs;
+      this.writeLogEvent('countdown', {
+        status: this.status.status,
+        attempts: this.status.attempts,
+        message: 'Checkout countdown tick.',
+        data: { timeRemainingMs: event.timeRemainingMs }
+      });
       return;
     }
 
@@ -156,16 +194,33 @@ export class CheckoutTaskManager {
       this.status.status = 'attempting';
       this.status.attempts = event.attempts;
       this.status.timeRemainingMs = 0;
+      this.writeLogEvent('attempt', {
+        status: this.status.status,
+        attempts: this.status.attempts,
+        message: `Checkout attempt ${this.status.attempts}.`,
+        data: event
+      });
       return;
     }
 
     if (event.type === 'result') {
       this.status.lastResult = event.result;
+      this.writeLogEvent('result', {
+        status: event.result?.status,
+        attempts: this.status.attempts,
+        message: `Checkout result: ${event.result?.status || 'unknown'}.`,
+        data: event.result
+      });
       return;
     }
 
     if (event.type === 'preparing') {
       this.status.status = 'preparing';
+      this.writeLogEvent('preparing', {
+        status: this.status.status,
+        attempts: this.status.attempts,
+        message: 'Preparing checkout page.'
+      });
       return;
     }
 
@@ -179,6 +234,28 @@ export class CheckoutTaskManager {
       if (this.status.logs.length > 200) {
         this.status.logs = this.status.logs.slice(-200);
       }
+      this.writeLogEvent('log', {
+        level: entry.level,
+        status: this.status.status,
+        attempts: this.status.attempts,
+        message: entry.message,
+        data: event
+      });
     }
+  }
+
+  writeLogEvent(eventType, entry = {}) {
+    if (!this.logger?.write) {
+      return;
+    }
+
+    this.logger.write({
+      eventType,
+      level: entry.level,
+      status: entry.status ?? this.status.status,
+      attempts: entry.attempts ?? this.status.attempts,
+      message: entry.message,
+      data: entry.data
+    }).catch(() => {});
   }
 }
