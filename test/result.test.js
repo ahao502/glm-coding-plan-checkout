@@ -19,6 +19,13 @@ test('formats fixed failure statuses', () => {
     plan: 'pro',
     billing: 'monthly_recurring'
   });
+
+  assert.deepEqual(failure(STATUSES.BUTTON_NEVER_ENABLED, { attempts: 12 }), {
+    status: STATUSES.BUTTON_NEVER_ENABLED,
+    plan: 'pro',
+    billing: 'monthly_recurring',
+    attempts: 12
+  });
 });
 
 test('formats out-of-stock with release time', () => {

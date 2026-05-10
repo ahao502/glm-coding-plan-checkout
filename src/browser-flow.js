@@ -8,13 +8,24 @@ import { classifyText, extractCheckoutCandidate } from './payload.js';
 import { checkoutReady, failure, outOfStock } from './result.js';
 import { formatDuration, formatLocalDateTime } from './time.js';
 import { isAllowedCheckoutUrl, isCheckoutApiUrl, looksLikeCheckoutUrl } from './url.js';
-import { buildRecipe, refreshDynamicTokens, replayRecipe, setupRequestCapture, shouldRefreshPage } from './api-capture.js';
+import {
+  buildRecipe,
+  isCheckoutApiRequest,
+  refreshDynamicTokens,
+  replayRecipe,
+  sanitizeHeaders,
+  setupRequestCapture,
+  shouldRefreshPage
+} from './api-capture.js';
 import { buildRecipeFromDiscoveryArtifacts, recipeDetail } from './checkout-discovery.js';
 
 const ACTION_TEXT_RE = /(立即购买|购买|订阅|开通|升级|Buy|Subscribe|Purchase)/i;
 const MONTHLY_TEXT_RE = /(连续包月|自动续费|包月|monthly|recurring)/i;
 const PRO_TEXT_RE = /\bpro\b|专业版|Pro/i;
 const DEFAULT_ATTEMPT_SETTLE_MS = 1000;
+export const DEFAULT_PRE_START_REFRESH_MS = 3000;
+export const DEFAULT_BUTTON_POLL_MS = 100;
+export const DEFAULT_DISABLED_REFRESH_MS = 800;
 
 async function fileExists(path) {
   try {
@@ -101,18 +112,56 @@ async function chooseMonthlyIfPresent(page) {
   }
 }
 
-async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = {}) {
-  await chooseMonthlyIfPresent(page);
+function compactButtonText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
 
-  const proText = page.getByText(PRO_TEXT_RE).first();
-  if ((await proText.count()) === 0) {
-    return { clicked: false, fingerprint: null };
+export function selectProCheckoutActionState(snapshots = [], { skipFingerprint = null } = {}) {
+  const scored = snapshots
+    .map((snapshot, index) => {
+      const text = compactButtonText(snapshot.text);
+      if (!ACTION_TEXT_RE.test(text) || !snapshot.visible || snapshot.proDepth == null) {
+        return null;
+      }
+
+      return {
+        ...snapshot,
+        text,
+        score: (snapshot.disabled ? 0 : 100) + (10 - snapshot.proDepth) - index
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const best = skipFingerprint
+    ? scored.find((item) => item.fingerprint !== skipFingerprint)
+    : scored[0];
+
+  if (!best) {
+    return {
+      found: false,
+      disabled: null,
+      text: '',
+      fingerprint: null
+    };
   }
 
-  const result = await page.evaluate(
-    ({ proSource, actionSource, skipFingerprint }) => {
+  return {
+    found: true,
+    disabled: Boolean(best.disabled),
+    text: best.text,
+    fingerprint: best.fingerprint
+  };
+}
+
+async function getProCheckoutActionState(page, { skipFingerprint = null, ensureMonthly = true } = {}) {
+  if (ensureMonthly) {
+    await chooseMonthlyIfPresent(page);
+  }
+
+  const snapshots = await page.evaluate(
+    ({ proSource }) => {
       const proRe = new RegExp(proSource, 'i');
-      const actionRe = new RegExp(actionSource, 'i');
       const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 
       function fingerprint(el) {
@@ -135,48 +184,78 @@ async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = 
         );
       }
 
-      function score(el) {
-        const text = el.innerText || el.textContent || '';
-        if (!actionRe.test(text) || !visible(el) || disabled(el)) {
-          return -1;
-        }
-
+      function proDepth(el) {
         let current = el;
-        for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+        for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
           const containerText = current.innerText || current.textContent || '';
           if (proRe.test(containerText)) {
-            return 10 - depth;
+            return depth;
           }
         }
-
-        return 0;
+        return null;
       }
 
-      const scored = candidates
-        .map((el) => ({ el, score: score(el), fp: fingerprint(el) }))
-        .filter((item) => item.score > 0)
-        .sort((a, b) => b.score - a.score);
-
-      const best = skipFingerprint
-        ? scored.find((item) => item.fp !== skipFingerprint)
-        : scored[0];
-
-      if (!best) {
-        return { clicked: false, fingerprint: null };
-      }
-
-      best.el.scrollIntoView({ block: 'center', inline: 'center' });
-      best.el.click();
-      return { clicked: true, fingerprint: best.fp };
+      return candidates.map((el) => ({
+        text: el.innerText || el.textContent || '',
+        visible: visible(el),
+        disabled: disabled(el),
+        fingerprint: fingerprint(el),
+        proDepth: proDepth(el)
+      }));
     },
     {
-      proSource: PRO_TEXT_RE.source,
-      actionSource: ACTION_TEXT_RE.source,
-      skipFingerprint: lastClickedFingerprint
+      proSource: PRO_TEXT_RE.source
     }
   );
 
-  return result;
+  return selectProCheckoutActionState(snapshots, { skipFingerprint });
+}
+
+async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = {}) {
+  const state = await getProCheckoutActionState(page, { skipFingerprint: lastClickedFingerprint });
+  if (!state.found || state.disabled) {
+    return { clicked: false, fingerprint: state.fingerprint, state };
+  }
+
+  const result = await page.evaluate(
+    ({ fingerprintToClick }) => {
+      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+      function fingerprint(el) {
+        const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+        const classes = Array.from(el.classList || []).sort().join('.');
+        return `${el.tagName.toLowerCase()}#${el.id || ''}.${classes}|${text}`;
+      }
+
+      function visible(el) {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      }
+
+      function disabled(el) {
+        return Boolean(
+          el.disabled ||
+          el.getAttribute('aria-disabled') === 'true' ||
+          el.closest('[disabled], [aria-disabled="true"]')
+        );
+      }
+
+      const best = candidates.find((el) => fingerprint(el) === fingerprintToClick);
+      if (!best || !visible(best) || disabled(best)) {
+        return { clicked: false, fingerprint: fingerprintToClick };
+      }
+
+      best.scrollIntoView({ block: 'center', inline: 'center' });
+      best.click();
+      return { clicked: true, fingerprint: fingerprintToClick };
+    },
+    {
+      fingerprintToClick: state.fingerprint
+    }
+  );
+
+  return { ...result, state };
 }
 
 async function currentPageCheckoutUrl(page) {
@@ -413,8 +492,27 @@ async function pageRequiresLogin(page) {
 }
 
 async function resetPageState(page) {
-  await page.reload({ waitUntil: 'networkidle' });
+  await page.reload({ waitUntil: 'domcontentloaded' });
   await chooseMonthlyIfPresent(page);
+}
+
+async function classifySettledPage(page) {
+  const pageCheckout = await currentPageCheckoutUrl(page);
+  if (pageCheckout) {
+    return pageCheckout;
+  }
+
+  const finalText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
+  const finalTextStatus = classifyText(finalText);
+  if (finalTextStatus === 'out_of_stock') {
+    return outOfStock();
+  }
+
+  if (await pageRequiresLogin(page)) {
+    return failure(STATUSES.LOGIN_REQUIRED);
+  }
+
+  return failure(STATUSES.CHECKOUT_NOT_CREATED);
 }
 
 async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
@@ -447,17 +545,7 @@ async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_S
     return responseResult;
   }
 
-  const finalText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
-  const finalTextStatus = classifyText(finalText);
-  if (finalTextStatus === 'out_of_stock') {
-    return outOfStock();
-  }
-
-  if (await pageRequiresLogin(page)) {
-    return failure(STATUSES.LOGIN_REQUIRED);
-  }
-
-  return failure(STATUSES.CHECKOUT_NOT_CREATED);
+  return classifySettledPage(page);
 }
 
 function defaultSleep(ms) {
@@ -542,6 +630,35 @@ async function captureFirstCheckoutAttempt(page, { attemptSettleMs = DEFAULT_ATT
   return { recipe, responseResult, pageCheckout };
 }
 
+function installPassiveCheckoutRequestCapture(page, onEvent) {
+  const captured = [];
+  const handler = (request) => {
+    if (!isCheckoutApiRequest(request)) {
+      return;
+    }
+
+    const entry = {
+      url: request.url(),
+      method: request.method(),
+      headers: sanitizeHeaders(request.headers()),
+      postData: request.postData() || null,
+      capturedAt: Date.now()
+    };
+    captured.push(entry);
+    onEvent?.({
+      type: 'log',
+      message: `提前捕获到 checkout API 请求: ${entry.method} ${entry.url}`,
+      level: 'info'
+    });
+  };
+
+  page.on('request', handler);
+  return {
+    captured,
+    dispose: () => page.off('request', handler)
+  };
+}
+
 export async function runFastClickCheckout({
   browserType = chromium,
   startAt,
@@ -550,6 +667,9 @@ export async function runFastClickCheckout({
   sleep = defaultSleep,
   retryIntervalMs = 500,
   attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS,
+  preStartRefreshMs = DEFAULT_PRE_START_REFRESH_MS,
+  buttonPollMs = DEFAULT_BUTTON_POLL_MS,
+  disabledRefreshMs = DEFAULT_DISABLED_REFRESH_MS,
   maxAttempts = Infinity,
   output: logOutput = output,
   signal,
@@ -560,8 +680,12 @@ export async function runFastClickCheckout({
   const browser = await browserType.launch({ headless });
   const context = await browser.newContext({ storageState });
   const page = await context.newPage();
+  const passiveCapture = installPassiveCheckoutRequestCapture(page, onEvent);
   let attempts = 0;
   let lastStatus;
+  let lastButtonState = null;
+  let sawEnabledButton = false;
+  let nextDisabledRefreshAt = 0;
 
   try {
     onEvent?.({ type: 'preparing' });
@@ -574,6 +698,27 @@ export async function runFastClickCheckout({
     await chooseMonthlyIfPresent(page);
 
     if (startAt && now() < startAt) {
+      const preRefreshAt = new Date(startAt.getTime() - Math.max(0, preStartRefreshMs));
+      if (preStartRefreshMs > 0 && now() < preRefreshAt) {
+        await waitUntilWithCountdown({
+          target: preRefreshAt,
+          now,
+          sleep,
+          output: logOutput,
+          signal,
+          onEvent
+        });
+      }
+
+      if (preStartRefreshMs > 0 && now() < startAt) {
+        onEvent?.({
+          type: 'log',
+          message: `开始前 ${preStartRefreshMs}ms 刷新页面，更新购买按钮状态`,
+          level: 'info'
+        });
+        await resetPageState(page);
+      }
+
       await waitUntilWithCountdown({
         target: startAt,
         now,
@@ -596,8 +741,63 @@ export async function runFastClickCheckout({
       onEvent?.({ type: 'attempt', attempts });
 
       let result;
+      const pageCheckout = await currentPageCheckoutUrl(page);
+      if (pageCheckout) {
+        result = pageCheckout;
+      }
 
-      if (recipe) {
+      if (!result && !recipe && passiveCapture.captured.length > 0) {
+        recipe = buildRecipe(passiveCapture.captured, null);
+        if (recipe) {
+          onEvent?.({ type: 'log', message: `使用提前捕获的 checkout 入口: ${recipeDetail(recipe)}`, level: 'info' });
+        }
+      }
+
+      const buttonState = !result && !recipe ? await getProCheckoutActionState(page, { ensureMonthly: false }) : null;
+      if (buttonState?.found) {
+        lastButtonState = buttonState;
+        onEvent?.({
+          type: 'log',
+          message: `购买按钮状态: disabled=${buttonState.disabled}, text="${buttonState.text}"`,
+          level: buttonState.disabled ? 'warn' : 'info'
+        });
+        if (!buttonState.disabled) {
+          sawEnabledButton = true;
+        }
+      }
+
+      if (!result && !recipe && buttonState?.found && buttonState.disabled) {
+        const nowMs = now().getTime();
+        if (nowMs >= nextDisabledRefreshAt) {
+          onEvent?.({
+            type: 'log',
+            message: '购买按钮仍不可用，刷新页面等待开放',
+            level: 'warn'
+          });
+          await resetPageState(page);
+          nextDisabledRefreshAt = now().getTime() + Math.max(0, disabledRefreshMs);
+
+          if (await pageRequiresLogin(page)) {
+            result = failure(STATUSES.LOGIN_REQUIRED);
+          } else {
+            const refreshedText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
+            if (classifyText(refreshedText) === 'out_of_stock') {
+              result = outOfStock();
+            }
+          }
+        }
+
+        if (!result) {
+          const remainingMs = stopAt ? stopAt.getTime() - now().getTime() : buttonPollMs;
+          if (remainingMs <= 0) {
+            break;
+          }
+          await sleepWithAbort(Math.min(Math.max(1, buttonPollMs), remainingMs), { sleep, signal });
+          continue;
+        }
+      }
+
+      if (!result && recipe) {
         if (shouldRefreshPage(attempts, recipe)) {
           logOutput.write('Refreshing page to reset state.\n');
           onEvent?.({ type: 'log', message: '刷新页面以重置状态，并刷新 token', level: 'info' });
@@ -646,36 +846,46 @@ export async function runFastClickCheckout({
             }
           }
         }
-      } else {
-        logOutput.write('Capturing checkout request.\n');
-        onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：先扫描灰色按钮入口`, level: 'info' });
-        const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
-        recipe = discovery.recipe;
-        result = discovery.result;
+      }
 
-        if (!result) {
-          onEvent?.({ type: 'log', message: '未从灰色按钮入口生成 checkout，首次点击并捕获 checkout API 请求', level: 'warn' });
+      if (!result && !recipe) {
+        if (buttonState?.found && !buttonState.disabled) {
+          onEvent?.({ type: 'log', message: '购买按钮已可用，立即点击并捕获 checkout API 请求', level: 'info' });
           const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
             await captureFirstCheckoutAttempt(page, { attemptSettleMs });
-
-          recipe = recipe || capturedRecipe;
-          result = pc || rr;
-        }
-
-        if (recipe) {
-          onEvent?.({ type: 'log', message: `当前可复用 recipe: ${recipeDetail(recipe)}`, level: 'info' });
+          recipe = capturedRecipe;
+          result = pc || rr || await classifySettledPage(page);
         } else {
-          onEvent?.({ type: 'log', message: '未捕获到 checkout API 请求，后续使用 DOM 点击模式', level: 'warn' });
-        }
+          logOutput.write('Capturing checkout request.\n');
+          onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：扫描购买入口`, level: 'info' });
+          const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
+          recipe = discovery.recipe;
+          result = discovery.result;
 
-        if (result) {
-          onEvent?.({ type: 'log', message: `首次尝试结果: ${result.status}`, level: 'info' });
-        }
+          if (!result) {
+            onEvent?.({ type: 'log', message: '未从页面入口生成 checkout，首次点击并捕获 checkout API 请求', level: 'warn' });
+            const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
+              await captureFirstCheckoutAttempt(page, { attemptSettleMs });
 
-        if (!result) {
-          logOutput.write('No API captured, falling back to DOM click.\n');
-          onEvent?.({ type: 'log', message: '降级为 DOM 点击重试', level: 'warn' });
-          result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+            recipe = recipe || capturedRecipe;
+            result = pc || rr;
+          }
+
+          if (recipe) {
+            onEvent?.({ type: 'log', message: `当前可复用 recipe: ${recipeDetail(recipe)}`, level: 'info' });
+          } else {
+            onEvent?.({ type: 'log', message: '未捕获到 checkout API 请求，后续使用 DOM 点击模式', level: 'warn' });
+          }
+
+          if (result) {
+            onEvent?.({ type: 'log', message: `首次尝试结果: ${result.status}`, level: 'info' });
+          }
+
+          if (!result) {
+            logOutput.write('No API captured, falling back to DOM click.\n');
+            onEvent?.({ type: 'log', message: '降级为 DOM 点击重试', level: 'warn' });
+            result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+          }
         }
       }
 
@@ -698,6 +908,14 @@ export async function runFastClickCheckout({
         };
       }
 
+      if (result?.status === STATUSES.OUT_OF_STOCK) {
+        onEvent?.({ type: 'log', message: '服务端确认库存不足/未开放', level: 'warn' });
+        return {
+          ...result,
+          attempts
+        };
+      }
+
       if (attempts >= maxAttempts) {
         break;
       }
@@ -714,6 +932,20 @@ export async function runFastClickCheckout({
       }
     }
 
+    if (!sawEnabledButton && lastButtonState?.disabled) {
+      return failure(STATUSES.BUTTON_NEVER_ENABLED, {
+        message: stopAt
+          ? `Retry window ended at ${formatLocalDateTime(stopAt)} while the purchase button stayed disabled.`
+          : 'Purchase button stayed disabled before the retry loop ended.',
+        attempts,
+        lastStatus,
+        button: {
+          disabled: lastButtonState.disabled,
+          text: lastButtonState.text
+        }
+      });
+    }
+
     return failure(STATUSES.CHECKOUT_NOT_CREATED, {
       message: stopAt
         ? `Retry window ended at ${formatLocalDateTime(stopAt)} before checkout was created.`
@@ -722,6 +954,7 @@ export async function runFastClickCheckout({
       lastStatus
     });
   } finally {
+    passiveCapture.dispose();
     await context.storageState({ path: storageState }).catch(() => {});
     await browser.close();
   }

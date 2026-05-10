@@ -41,7 +41,7 @@ ui-server.js ──► task-manager.js ──► scheduler.js, browser-flow.js
 
 Success: `{ status: "checkout_ready", plan: "pro", billing: "monthly_recurring", checkoutUrl: "...", orderId?: "..." }`
 
-Failure statuses: `login_required`, `out_of_stock`, `plan_not_found`, `checkout_not_created`, `contract_changed`.
+Failure statuses: `login_required`, `out_of_stock`, `plan_not_found`, `button_never_enabled`, `checkout_not_created`, `contract_changed`.
 
 ### Auth storage
 

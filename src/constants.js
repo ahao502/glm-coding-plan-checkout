@@ -11,6 +11,7 @@ export const STATUSES = Object.freeze({
   LOGIN_REQUIRED: 'login_required',
   OUT_OF_STOCK: 'out_of_stock',
   PLAN_NOT_FOUND: 'plan_not_found',
+  BUTTON_NEVER_ENABLED: 'button_never_enabled',
   CHECKOUT_NOT_CREATED: 'checkout_not_created',
   CONTRACT_CHANGED: 'contract_changed'
 });

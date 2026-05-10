@@ -354,6 +354,7 @@ function html() {
         success: '成功',
         stopped: '已停止',
         checkout_not_created: '未生成',
+        button_never_enabled: '按钮未开放',
         login_required: '需登录',
         contract_changed: '异常'
       }[status] || status || '未知';

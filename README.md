@@ -72,6 +72,7 @@ Known failure statuses:
 - `login_required`
 - `out_of_stock`
 - `plan_not_found`
+- `button_never_enabled`
 - `checkout_not_created`
 - `contract_changed`
 
