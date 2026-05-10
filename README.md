@@ -1,6 +1,6 @@
 # GLM Coding Plan Checkout CLI
 
-Creates a GLM Coding `Pro` monthly recurring checkout link and stops before payment.
+Creates a selected GLM Coding checkout link and stops before payment. The default target is `Pro` monthly recurring.
 
 ## Install
 
@@ -24,7 +24,7 @@ The command is designed to be started manually around 09:55 local time. It opens
 
 If you start it after 10:05, it waits for the next day's 10:00 window instead of exiting immediately. While waiting, it prints a countdown like `Time remaining: 0h 05m 00s` to stderr.
 
-Retry interval defaults to 500ms and can be changed with `GLM_RETRY_INTERVAL_MS`:
+The internal retry interval defaults to 500ms and can still be changed for advanced CLI use with `GLM_RETRY_INTERVAL_MS`:
 
 ```sh
 GLM_RETRY_INTERVAL_MS=500 npm run buy:glm-coding
@@ -36,7 +36,7 @@ GLM_RETRY_INTERVAL_MS=500 npm run buy:glm-coding
 npm run ui
 ```
 
-Open `http://127.0.0.1:3000`. The local page lets you choose the next execution time, set the retry interval, view the countdown, start the checkout task, and stop the running task without exiting the UI server.
+Open `http://127.0.0.1:3000`. The local page lets you choose the next execution time, target plan (`Lite`, `Pro`, `Max`), billing cycle (`monthly`, `quarterly`, `yearly`), view the countdown, start the checkout task, and stop the running task without exiting the UI server. Retry timing is kept internal to reduce UI noise.
 
 The command prints JSON to stdout. Progress and login prompts are written to stderr.
 
@@ -60,8 +60,8 @@ Successful output:
 ```json
 {
   "status": "checkout_ready",
-  "plan": "pro",
-  "billing": "monthly_recurring",
+  "plan": "lite | pro | max",
+  "billing": "monthly_recurring | quarterly_recurring | yearly_recurring",
   "checkoutUrl": "https://bigmodel.cn/...",
   "orderId": "optional-if-available"
 }

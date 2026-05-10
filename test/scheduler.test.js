@@ -40,6 +40,8 @@ test('passes the 10:00-10:05 window to a single long-lived runner', async () => 
   assert.equal(calls[0].startAt.getMinutes(), 0);
   assert.equal(calls[0].stopAt.getHours(), 10);
   assert.equal(calls[0].stopAt.getMinutes(), 5);
+  assert.equal(calls[0].plan, 'pro');
+  assert.equal(calls[0].billing, 'monthly_recurring');
   assert.equal(calls[0].retryIntervalMs, DEFAULT_RETRY_INTERVAL_MS);
   assert.equal(result.status, STATUSES.CHECKOUT_READY);
 });
@@ -86,6 +88,28 @@ test('uses an explicit retry interval override', async () => {
   });
 
   assert.equal(receivedRetryIntervalMs, 250);
+});
+
+test('passes an explicit target plan and billing to the runner', async () => {
+  const current = new Date(2026, 0, 1, 9, 55, 0, 0);
+  let received;
+
+  await runScheduledCheckout({
+    now: () => current,
+    runCheckout: async ({ plan, billing }) => {
+      received = { plan, billing };
+      return checkoutReady({ checkoutUrl: 'https://bigmodel.cn/pay/abc', plan, billing });
+    },
+    output: silentOutput(),
+    plan: 'lite',
+    billing: 'quarterly_recurring',
+    createLogger: memoryLogger()
+  });
+
+  assert.deepEqual(received, {
+    plan: 'lite',
+    billing: 'quarterly_recurring'
+  });
 });
 
 test('returns login-required failures from the long-lived runner', async () => {

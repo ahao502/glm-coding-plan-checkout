@@ -30,7 +30,7 @@ ui-server.js ──► task-manager.js ──► scheduler.js, browser-flow.js
 - **`src/constants.js`** — The single source of truth: GLM Coding URL, plan/billing values, window time, storage path, and the `STATUSES` enum. Imported by almost every module.
 - **`src/url.js`** — URL safety checks. Only `bigmodel.cn` and `www.bigmodel.cn` over HTTPS are allowed. `looksLikeCheckoutUrl` additionally checks for checkout-related path segments.
 - **`src/payload.js`** — Recurses through API response JSON to find checkout URLs and order IDs. `classifyText` detects out-of-stock and login-required via regex.
-- **`src/browser-flow.js`** — Core Playwright automation. On first run, opens a visible browser for manual login and saves `storageState` to `.auth/glm-coding/storageState.json`. Subsequent runs reuse that state (headless or visible). The main loop: load page → wait for 10:00 if early → click the "Pro" action button → capture checkout URLs from network responses or page links. Supports `AbortController` signals and `onEvent` callbacks.
+- **`src/browser-flow.js`** — Core Playwright automation. On first run, opens a visible browser for manual login and saves `storageState` to `.auth/glm-coding/storageState.json`. Subsequent runs reuse that state (headless or visible). The main loop: load page → choose the target billing cycle → wait for 10:00 if early → inspect the selected Lite/Pro/Max card → click only the selected target's action button → capture checkout URLs from network responses or page links. Supports `AbortController` signals and `onEvent` callbacks.
 - **`src/scheduler.js`** — Calculates the next 10:00-10:05 window. Passes `startAt`/`stopAt` to `browser-flow.js`'s `runFastClickCheckout`. Resolves `GLM_RETRY_INTERVAL_MS` from env.
 - **`src/result.js`** — Factory functions for the JSON result shape (status, plan, billing, checkoutUrl, optional orderId). `printJson` writes to stdout.
 - **`src/cli.js`** — Entry point. Calls `runScheduledCheckout`, prints the JSON result to stdout, exits 0 on success / 1 on failure.
@@ -39,7 +39,7 @@ ui-server.js ──► task-manager.js ──► scheduler.js, browser-flow.js
 
 ### Result JSON shape
 
-Success: `{ status: "checkout_ready", plan: "pro", billing: "monthly_recurring", checkoutUrl: "...", orderId?: "..." }`
+Success: `{ status: "checkout_ready", plan: "lite" | "pro" | "max", billing: "monthly_recurring" | "quarterly_recurring" | "yearly_recurring", checkoutUrl: "...", orderId?: "..." }`
 
 Failure statuses: `login_required`, `out_of_stock`, `plan_not_found`, `button_never_enabled`, `checkout_not_created`, `contract_changed`.
 

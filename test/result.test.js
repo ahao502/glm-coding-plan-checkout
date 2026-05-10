@@ -13,6 +13,19 @@ test('formats checkout-ready JSON payload', () => {
   });
 });
 
+test('formats checkout-ready JSON payload with a selected target', () => {
+  assert.deepEqual(checkoutReady({
+    checkoutUrl: 'https://bigmodel.cn/pay/abc',
+    plan: 'max',
+    billing: 'yearly_recurring'
+  }), {
+    status: STATUSES.CHECKOUT_READY,
+    plan: 'max',
+    billing: 'yearly_recurring',
+    checkoutUrl: 'https://bigmodel.cn/pay/abc'
+  });
+});
+
 test('formats fixed failure statuses', () => {
   assert.deepEqual(failure(STATUSES.PLAN_NOT_FOUND), {
     status: STATUSES.PLAN_NOT_FOUND,

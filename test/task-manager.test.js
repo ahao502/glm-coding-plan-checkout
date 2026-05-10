@@ -78,13 +78,20 @@ test('status includes running task fields and latest result', async () => {
     }
   });
 
-  const result = await manager.start({ startAt: new Date(2026, 0, 1, 10, 0), retryIntervalMs: 250 });
+  const result = await manager.start({
+    startAt: new Date(2026, 0, 1, 10, 0),
+    plan: 'max',
+    billing: 'yearly_recurring',
+    retryIntervalMs: 250
+  });
   const status = manager.getStatus();
 
   assert.equal(result.status, 'checkout_ready');
   assert.equal(status.running, false);
   assert.equal(status.status, 'success');
   assert.equal(status.attempts, 2);
+  assert.equal(status.plan, 'max');
+  assert.equal(status.billing, 'yearly_recurring');
   assert.equal(status.retryIntervalMs, 250);
   assert.equal(status.lastResult.checkoutUrl, 'https://bigmodel.cn/pay/abc');
 });
@@ -102,7 +109,12 @@ test('writes task lifecycle and checkout events to logger', async () => {
     }
   });
 
-  await manager.start({ startAt: new Date(2026, 4, 6, 10, 0), retryIntervalMs: 500 });
+  await manager.start({
+    startAt: new Date(2026, 4, 6, 10, 0),
+    plan: 'lite',
+    billing: 'quarterly_recurring',
+    retryIntervalMs: 500
+  });
 
   assert.deepEqual(entries.map((entry) => entry.eventType), [
     'task_started',
@@ -112,6 +124,8 @@ test('writes task lifecycle and checkout events to logger', async () => {
     'task_finished'
   ]);
   assert.equal(entries[2].message, '解析到灰色按钮入口: POST https://bigmodel.cn/api/order/create');
+  assert.equal(entries[0].data.plan, 'lite');
+  assert.equal(entries[0].data.billing, 'quarterly_recurring');
   assert.equal(entries[4].data.checkoutUrl, 'https://bigmodel.cn/pay/abc');
 });
 

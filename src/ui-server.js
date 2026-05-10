@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
-import { DEFAULT_RETRY_INTERVAL_MS } from './scheduler.js';
 import { CheckoutTaskManager, defaultStartAt } from './task-manager.js';
+import { BILLING, BILLING_OPTIONS, PLAN, PLAN_OPTIONS } from './constants.js';
 
 const HOST = process.env.GLM_UI_HOST || '127.0.0.1';
 const PORT = Number(process.env.GLM_UI_PORT || 3000);
@@ -137,7 +137,7 @@ function html() {
       font-weight: 650;
     }
 
-    input {
+    input, select {
       width: 100%;
       height: 42px;
       border: 1px solid var(--line);
@@ -148,7 +148,7 @@ function html() {
       font-size: 15px;
     }
 
-    input:focus {
+    input:focus, select:focus {
       outline: 2px solid rgba(23, 92, 255, 0.18);
       border-color: var(--primary);
     }
@@ -291,8 +291,12 @@ function html() {
               <input id="startAt" type="datetime-local">
             </div>
             <div>
-              <label for="retryIntervalMs">重试间隔（毫秒）</label>
-              <input id="retryIntervalMs" type="number" min="100" step="50" value="500">
+              <label for="plan">套餐</label>
+              <select id="plan"></select>
+            </div>
+            <div>
+              <label for="billing">周期</label>
+              <select id="billing"></select>
             </div>
           </div>
           <div class="actions">
@@ -326,7 +330,8 @@ function html() {
 
   <script>
     const startAt = document.querySelector('#startAt');
-    const retryIntervalMs = document.querySelector('#retryIntervalMs');
+    const plan = document.querySelector('#plan');
+    const billing = document.querySelector('#billing');
     const startBtn = document.querySelector('#startBtn');
     const stopBtn = document.querySelector('#stopBtn');
     const statusPill = document.querySelector('#statusPill');
@@ -353,6 +358,7 @@ function html() {
         attempting: '尝试中',
         success: '成功',
         stopped: '已停止',
+        busy_retryable: '拥挤重试',
         checkout_not_created: '未生成',
         button_never_enabled: '按钮未开放',
         login_required: '需登录',
@@ -374,7 +380,14 @@ function html() {
     async function loadDefaults() {
       const defaults = await api('/api/defaults');
       startAt.value = defaults.startAtLocal;
-      retryIntervalMs.value = defaults.retryIntervalMs;
+      plan.innerHTML = defaults.plans.map(option =>
+        '<option value="' + option.value + '">' + option.label + '</option>'
+      ).join('');
+      billing.innerHTML = defaults.billings.map(option =>
+        '<option value="' + option.value + '">' + option.label + '</option>'
+      ).join('');
+      plan.value = defaults.plan;
+      billing.value = defaults.billing;
     }
 
     function render(status) {
@@ -427,7 +440,8 @@ function html() {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             startAt: startAt.value,
-            retryIntervalMs: Number(retryIntervalMs.value)
+            plan: plan.value,
+            billing: billing.value
           })
         });
         await refresh();
@@ -461,7 +475,10 @@ async function route(req, res) {
     json(res, 200, {
       startAt: defaultStartAt().toISOString(),
       startAtLocal: toLocalInputValue(defaultStartAt()),
-      retryIntervalMs: DEFAULT_RETRY_INTERVAL_MS
+      plan: PLAN,
+      billing: BILLING,
+      plans: PLAN_OPTIONS,
+      billings: BILLING_OPTIONS
     });
     return;
   }
@@ -476,7 +493,8 @@ async function route(req, res) {
       const body = await readJson(req);
       manager.start({
         startAt: body.startAt,
-        retryIntervalMs: body.retryIntervalMs
+        plan: body.plan,
+        billing: body.billing
       });
       json(res, 202, manager.getStatus());
     } catch (error) {

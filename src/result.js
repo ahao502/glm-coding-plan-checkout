@@ -1,10 +1,10 @@
 import { BILLING, NEXT_RELEASE_AT, PLAN, STATUSES } from './constants.js';
 
-export function checkoutReady({ checkoutUrl, orderId }) {
+export function checkoutReady({ checkoutUrl, orderId, plan = PLAN, billing = BILLING }) {
   const result = {
     status: STATUSES.CHECKOUT_READY,
-    plan: PLAN,
-    billing: BILLING,
+    plan,
+    billing,
     checkoutUrl
   };
 

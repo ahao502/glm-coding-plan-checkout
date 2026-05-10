@@ -3,7 +3,15 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stderr as output } from 'node:process';
 import { dirname } from 'node:path';
 import { chromium } from 'playwright';
-import { GLM_CODING_URL, STATUSES, STORAGE_STATE_PATH } from './constants.js';
+import {
+  billingLabel,
+  GLM_CODING_URL,
+  normalizeBilling,
+  normalizePlan,
+  planLabel,
+  STATUSES,
+  STORAGE_STATE_PATH
+} from './constants.js';
 import { classifyText, extractCheckoutCandidate } from './payload.js';
 import { checkoutReady, failure, outOfStock } from './result.js';
 import { formatDuration, formatLocalDateTime } from './time.js';
@@ -20,12 +28,15 @@ import {
 import { buildRecipeFromDiscoveryArtifacts, recipeDetail } from './checkout-discovery.js';
 
 const ACTION_TEXT_RE = /(立即购买|购买|订阅|开通|升级|Buy|Subscribe|Purchase)/i;
-const MONTHLY_TEXT_RE = /(连续包月|自动续费|包月|monthly|recurring)/i;
-const PRO_TEXT_RE = /\bpro\b|专业版|Pro/i;
+const BUSY_RETRYABLE_TEXT_RE = /(抢购人数过多|刷新再试|稍后再试|too\s*many|try\s*again|busy)/i;
+const SCHEDULED_RESTOCK_TEXT_RE = /(暂时售罄|补货|释放新库存|限售期间)/i;
+const RESTOCK_AT_RE = /(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*补货/;
 const DEFAULT_ATTEMPT_SETTLE_MS = 1000;
 export const DEFAULT_PRE_START_REFRESH_MS = 3000;
 export const DEFAULT_BUTTON_POLL_MS = 100;
 export const DEFAULT_DISABLED_REFRESH_MS = 800;
+export const DEFAULT_BUSY_REFRESH_MS = 500;
+export const DEFAULT_SCHEDULED_RESTOCK_POLL_MS = 100;
 
 async function fileExists(path) {
   try {
@@ -76,37 +87,49 @@ async function responseToJsonOrText(response) {
   }
 }
 
-async function captureCheckoutFromResponse(response, pageUrl) {
+function targetPayload(target) {
+  return {
+    plan: target.plan,
+    billing: target.billing
+  };
+}
+
+async function captureCheckoutFromResponse(response, pageUrl, target) {
   const body = await responseToJsonOrText(response);
   const text = typeof body === 'string' ? body : JSON.stringify(body);
   const status = classifyText(text);
 
   if (status === 'out_of_stock') {
-    return outOfStock();
+    return outOfStock(targetPayload(target));
+  }
+
+  if (status === 'busy_retryable') {
+    return failure(STATUSES.BUSY_RETRYABLE, targetPayload(target));
   }
 
   if (status === 'login_required' || response.status() === 401 || response.status() === 403) {
-    return failure(STATUSES.LOGIN_REQUIRED);
+    return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
   if (body && typeof body === 'object') {
     const candidate = extractCheckoutCandidate(body, pageUrl);
     if (candidate.checkoutUrl) {
-      return checkoutReady(candidate);
+      return checkoutReady({ ...candidate, ...targetPayload(target) });
     }
   }
 
   return null;
 }
 
-async function chooseMonthlyIfPresent(page) {
-  const monthly = page.getByText(MONTHLY_TEXT_RE).first();
-  if ((await monthly.count()) === 0) {
+async function chooseBillingIfPresent(page, target) {
+  const label = billingLabel(target.billing);
+  const billing = page.getByText(label, { exact: true }).first();
+  if ((await billing.count()) === 0) {
     return;
   }
 
   try {
-    await monthly.click({ timeout: 2000 });
+    await billing.click({ timeout: 2000 });
   } catch {
     // Some pages render the selected billing mode as plain text; that is fine.
   }
@@ -116,18 +139,79 @@ function compactButtonText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
 }
 
-export function selectProCheckoutActionState(snapshots = [], { skipFingerprint = null } = {}) {
+function parseRestockAt(text, now = new Date()) {
+  const match = String(text || '').match(RESTOCK_AT_RE);
+  if (!match) {
+    return null;
+  }
+
+  const [, month, day, hour, minute] = match.map(Number);
+  const candidate = new Date(now.getFullYear(), month - 1, day, hour, minute, 0, 0);
+  if (Number.isNaN(candidate.getTime())) {
+    return null;
+  }
+
+  if (candidate.getTime() + 24 * 60 * 60 * 1000 < now.getTime()) {
+    candidate.setFullYear(candidate.getFullYear() + 1);
+  }
+
+  return candidate;
+}
+
+export function classifyProCardText(text, { disabled = false, now = new Date() } = {}) {
+  const compactText = compactButtonText(text);
+  if (BUSY_RETRYABLE_TEXT_RE.test(compactText)) {
+    return {
+      cardState: 'busy_retryable',
+      restockAt: null
+    };
+  }
+
+  if (SCHEDULED_RESTOCK_TEXT_RE.test(compactText)) {
+    return {
+      cardState: 'scheduled_restock',
+      restockAt: parseRestockAt(compactText, now)
+    };
+  }
+
+  if (ACTION_TEXT_RE.test(compactText)) {
+    return {
+      cardState: disabled ? 'disabled' : 'available',
+      restockAt: null
+    };
+  }
+
+  return {
+    cardState: disabled ? 'disabled' : 'unknown',
+    restockAt: null
+  };
+}
+
+export function selectCheckoutActionState(snapshots = [], { skipFingerprint = null, now = new Date() } = {}) {
   const scored = snapshots
     .map((snapshot, index) => {
       const text = compactButtonText(snapshot.text);
-      if (!ACTION_TEXT_RE.test(text) || !snapshot.visible || snapshot.proDepth == null) {
+      if (!snapshot.visible || snapshot.planDepth == null) {
         return null;
       }
 
+      const classified = classifyProCardText(text, { disabled: snapshot.disabled, now });
+      if (classified.cardState === 'unknown') {
+        return null;
+      }
+
+      const stateWeight = {
+        available: 300,
+        busy_retryable: 250,
+        scheduled_restock: 200,
+        disabled: 100
+      }[classified.cardState] || 0;
+
       return {
         ...snapshot,
+        ...classified,
         text,
-        score: (snapshot.disabled ? 0 : 100) + (10 - snapshot.proDepth) - index
+        score: stateWeight + (10 - snapshot.planDepth) - index
       };
     })
     .filter(Boolean)
@@ -150,18 +234,28 @@ export function selectProCheckoutActionState(snapshots = [], { skipFingerprint =
     found: true,
     disabled: Boolean(best.disabled),
     text: best.text,
-    fingerprint: best.fingerprint
+    fingerprint: best.fingerprint,
+    cardState: best.cardState,
+    restockAt: best.restockAt
   };
 }
 
-async function getProCheckoutActionState(page, { skipFingerprint = null, ensureMonthly = true } = {}) {
-  if (ensureMonthly) {
-    await chooseMonthlyIfPresent(page);
+export function selectProCheckoutActionState(snapshots = [], options = {}) {
+  const normalized = snapshots.map((snapshot) => ({
+    ...snapshot,
+    planDepth: snapshot.planDepth ?? snapshot.proDepth
+  }));
+  return selectCheckoutActionState(normalized, options);
+}
+
+async function getCheckoutActionState(page, target, { skipFingerprint = null, ensureBilling = true, now = new Date() } = {}) {
+  if (ensureBilling) {
+    await chooseBillingIfPresent(page, target);
   }
 
   const snapshots = await page.evaluate(
-    ({ proSource }) => {
-      const proRe = new RegExp(proSource, 'i');
+    ({ targetPlanLabel }) => {
+      const targetPlan = targetPlanLabel.toLowerCase();
       const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 
       function fingerprint(el) {
@@ -184,11 +278,26 @@ async function getProCheckoutActionState(page, { skipFingerprint = null, ensureM
         );
       }
 
-      function proDepth(el) {
+      function compactText(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+      }
+
+      function exactPlanCount(container, plan) {
+        const items = [container, ...Array.from(container.querySelectorAll('*'))];
+        return items.filter((item) => compactText(item.innerText || item.textContent).toLowerCase() === plan).length;
+      }
+
+      function isTargetCardContainer(container) {
+        return (
+          exactPlanCount(container, targetPlan) > 0 &&
+          ['lite', 'pro', 'max'].filter((plan) => plan !== targetPlan).every((plan) => exactPlanCount(container, plan) === 0)
+        );
+      }
+
+      function planDepth(el) {
         let current = el;
         for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
-          const containerText = current.innerText || current.textContent || '';
-          if (proRe.test(containerText)) {
+          if (isTargetCardContainer(current)) {
             return depth;
           }
         }
@@ -200,20 +309,20 @@ async function getProCheckoutActionState(page, { skipFingerprint = null, ensureM
         visible: visible(el),
         disabled: disabled(el),
         fingerprint: fingerprint(el),
-        proDepth: proDepth(el)
+        planDepth: planDepth(el)
       }));
     },
     {
-      proSource: PRO_TEXT_RE.source
+      targetPlanLabel: planLabel(target.plan)
     }
   );
 
-  return selectProCheckoutActionState(snapshots, { skipFingerprint });
+  return selectCheckoutActionState(snapshots, { skipFingerprint, now });
 }
 
-async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = {}) {
-  const state = await getProCheckoutActionState(page, { skipFingerprint: lastClickedFingerprint });
-  if (!state.found || state.disabled) {
+async function clickCheckoutAction(page, target, { lastClickedFingerprint = null } = {}) {
+  const state = await getCheckoutActionState(page, target, { skipFingerprint: lastClickedFingerprint });
+  if (!state.found || state.cardState !== 'available') {
     return { clicked: false, fingerprint: state.fingerprint, state };
   }
 
@@ -258,10 +367,10 @@ async function clickProCheckoutAction(page, { lastClickedFingerprint = null } = 
   return { ...result, state };
 }
 
-async function currentPageCheckoutUrl(page) {
+async function currentPageCheckoutUrl(page, target) {
   const url = page.url();
   if (looksLikeCheckoutUrl(url)) {
-    return checkoutReady({ checkoutUrl: url });
+    return checkoutReady({ checkoutUrl: url, ...targetPayload(target) });
   }
 
   for (const locator of [page.locator('a[href]').filter({ hasText: ACTION_TEXT_RE }), page.locator('a[href]')]) {
@@ -271,7 +380,7 @@ async function currentPageCheckoutUrl(page) {
       try {
         const absolute = new URL(href, page.url()).toString();
         if (looksLikeCheckoutUrl(absolute) && isAllowedCheckoutUrl(absolute)) {
-          return checkoutReady({ checkoutUrl: absolute });
+          return checkoutReady({ checkoutUrl: absolute, ...targetPayload(target) });
         }
       } catch {
         // Ignore malformed href values.
@@ -282,13 +391,13 @@ async function currentPageCheckoutUrl(page) {
   return null;
 }
 
-async function discoverCheckoutRecipeFromPage(page) {
-  await chooseMonthlyIfPresent(page);
+async function discoverCheckoutRecipeFromPage(page, target) {
+  await chooseBillingIfPresent(page, target);
 
   const artifacts = await page.evaluate(
-    ({ proSource, actionSource }) => {
-      const proRe = new RegExp(proSource, 'i');
+    ({ actionSource, targetPlanLabel }) => {
       const actionRe = new RegExp(actionSource, 'i');
+      const targetPlan = targetPlanLabel.toLowerCase();
       const controls = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
 
       function textOf(el) {
@@ -325,6 +434,22 @@ async function discoverCheckoutRecipeFromPage(page) {
         }
       }
 
+      function compactText(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+      }
+
+      function exactPlanCount(container, plan) {
+        const items = [container, ...Array.from(container.querySelectorAll('*'))];
+        return items.filter((item) => compactText(item.innerText || item.textContent).toLowerCase() === plan).length;
+      }
+
+      function isTargetCardContainer(container) {
+        return (
+          exactPlanCount(container, targetPlan) > 0 &&
+          ['lite', 'pro', 'max'].filter((plan) => plan !== targetPlan).every((plan) => exactPlanCount(container, plan) === 0)
+        );
+      }
+
       function relevantControl(el) {
         const text = textOf(el);
         if (!actionRe.test(text) || !visible(el)) {
@@ -333,19 +458,17 @@ async function discoverCheckoutRecipeFromPage(page) {
 
         let current = el;
         for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
-          const containerText = current.innerText || current.textContent || '';
-          if (proRe.test(containerText)) {
+          if (isTargetCardContainer(current)) {
             return true;
           }
         }
         return false;
       }
 
-      function nearestProContainer(el) {
+      function nearestTargetContainer(el) {
         let best = el;
         for (let depth = 0, current = el; current && depth < 7; depth += 1, current = current.parentElement) {
-          const text = current.innerText || current.textContent || '';
-          if (proRe.test(text)) {
+          if (isTargetCardContainer(current)) {
             best = current;
           }
         }
@@ -362,7 +485,7 @@ async function discoverCheckoutRecipeFromPage(page) {
           pushAttrs(values, current, 'ancestor');
         }
 
-        const container = nearestProContainer(control);
+        const container = nearestTargetContainer(control);
         const related = Array.from(container.querySelectorAll('a, button, form, input, [href], [action], [onclick], [data-url], [data-href], [data-api]')).slice(0, 80);
         for (const el of related) {
           pushAttrs(values, el, 'related');
@@ -404,15 +527,15 @@ async function discoverCheckoutRecipeFromPage(page) {
       return artifacts;
     },
     {
-      proSource: PRO_TEXT_RE.source,
-      actionSource: ACTION_TEXT_RE.source
+      actionSource: ACTION_TEXT_RE.source,
+      targetPlanLabel: planLabel(target.plan)
     }
   );
 
   return buildRecipeFromDiscoveryArtifacts(artifacts, page.url());
 }
 
-async function attemptDiscoveredRecipe(page, recipe, onEvent) {
+async function attemptDiscoveredRecipe(page, recipe, target, onEvent) {
   const detail = recipeDetail(recipe);
   onEvent?.({
     type: 'log',
@@ -437,23 +560,28 @@ async function attemptDiscoveredRecipe(page, recipe, onEvent) {
   const textStatus = classifyText(bodyText);
   if (textStatus === 'out_of_stock') {
     onEvent?.({ type: 'log', message: '服务端返回库存不足/未开放', level: 'warn' });
-    return outOfStock();
+    return outOfStock(targetPayload(target));
+  }
+
+  if (textStatus === 'busy_retryable') {
+    onEvent?.({ type: 'log', message: '服务端返回抢购人数过多，需要刷新重试', level: 'warn' });
+    return failure(STATUSES.BUSY_RETRYABLE, targetPayload(target));
   }
 
   if (textStatus === 'login_required' || replayResult.status === 401 || replayResult.status === 403) {
     onEvent?.({ type: 'log', message: '服务端返回需要登录或无权限', level: 'error' });
-    return failure(STATUSES.LOGIN_REQUIRED);
+    return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
   if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
     const candidate = extractCheckoutCandidate(replayResult.body, page.url());
     if (candidate.checkoutUrl) {
       onEvent?.({ type: 'log', message: `成功解析 checkoutUrl: ${candidate.checkoutUrl}`, level: 'info' });
-      return checkoutReady(candidate);
+      return checkoutReady({ ...candidate, ...targetPayload(target) });
     }
   }
 
-  const pageCheckout = await currentPageCheckoutUrl(page);
+  const pageCheckout = await currentPageCheckoutUrl(page, target);
   if (pageCheckout) {
     onEvent?.({ type: 'log', message: `页面导航到 checkout URL: ${pageCheckout.checkoutUrl}`, level: 'info' });
     return pageCheckout;
@@ -466,8 +594,8 @@ async function attemptDiscoveredRecipe(page, recipe, onEvent) {
   return null;
 }
 
-async function discoverAndAttemptCheckoutRecipe(page, onEvent) {
-  const discoveredRecipe = await discoverCheckoutRecipeFromPage(page);
+async function discoverAndAttemptCheckoutRecipe(page, target, onEvent) {
+  const discoveredRecipe = await discoverCheckoutRecipeFromPage(page, target);
   if (!discoveredRecipe) {
     return { recipe: null, result: null };
   }
@@ -478,7 +606,7 @@ async function discoverAndAttemptCheckoutRecipe(page, onEvent) {
     level: 'info'
   });
 
-  const result = await attemptDiscoveredRecipe(page, discoveredRecipe, onEvent);
+  const result = await attemptDiscoveredRecipe(page, discoveredRecipe, target, onEvent);
   return { recipe: discoveredRecipe, result };
 }
 
@@ -491,13 +619,13 @@ async function pageRequiresLogin(page) {
   return /(请先登录|未登录|登录后|login\s+required|please\s+log\s+in)/i.test(body);
 }
 
-async function resetPageState(page) {
+async function resetPageState(page, target) {
   await page.reload({ waitUntil: 'domcontentloaded' });
-  await chooseMonthlyIfPresent(page);
+  await chooseBillingIfPresent(page, target);
 }
 
-async function classifySettledPage(page) {
-  const pageCheckout = await currentPageCheckoutUrl(page);
+async function classifySettledPage(page, target) {
+  const pageCheckout = await currentPageCheckoutUrl(page, target);
   if (pageCheckout) {
     return pageCheckout;
   }
@@ -505,30 +633,33 @@ async function classifySettledPage(page) {
   const finalText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
   const finalTextStatus = classifyText(finalText);
   if (finalTextStatus === 'out_of_stock') {
-    return outOfStock();
+    return outOfStock(targetPayload(target));
+  }
+  if (finalTextStatus === 'busy_retryable') {
+    return failure(STATUSES.BUSY_RETRYABLE, targetPayload(target));
   }
 
   if (await pageRequiresLogin(page)) {
-    return failure(STATUSES.LOGIN_REQUIRED);
+    return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
-  return failure(STATUSES.CHECKOUT_NOT_CREATED);
+  return failure(STATUSES.CHECKOUT_NOT_CREATED, targetPayload(target));
 }
 
-async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
+async function attemptCheckoutOnPage(page, target, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
   if (await pageRequiresLogin(page)) {
-    return failure(STATUSES.LOGIN_REQUIRED);
+    return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
   const responsePromise = page
     .waitForResponse(checkoutResponseCandidate)
-    .then((response) => captureCheckoutFromResponse(response, page.url()))
+    .then((response) => captureCheckoutFromResponse(response, page.url(), target))
     .catch(() => null);
 
-  const { clicked } = await clickProCheckoutAction(page);
+  const { clicked } = await clickCheckoutAction(page, target);
   if (!clicked) {
     await Promise.race([responsePromise, defaultSleep(attemptSettleMs)]).catch(() => {});
-    return failure(STATUSES.PLAN_NOT_FOUND);
+    return failure(STATUSES.PLAN_NOT_FOUND, targetPayload(target));
   }
 
   const responseResult = await Promise.race([
@@ -536,7 +667,7 @@ async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_S
     defaultSleep(attemptSettleMs).then(() => null)
   ]);
 
-  const pageCheckout = await currentPageCheckoutUrl(page);
+  const pageCheckout = await currentPageCheckoutUrl(page, target);
   if (pageCheckout) {
     return pageCheckout;
   }
@@ -545,7 +676,7 @@ async function attemptCheckoutOnPage(page, { attemptSettleMs = DEFAULT_ATTEMPT_S
     return responseResult;
   }
 
-  return classifySettledPage(page);
+  return classifySettledPage(page, target);
 }
 
 function defaultSleep(ms) {
@@ -601,15 +732,15 @@ async function waitUntilWithCountdown({
   }
 }
 
-async function captureFirstCheckoutAttempt(page, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
+async function captureFirstCheckoutAttempt(page, target, { attemptSettleMs = DEFAULT_ATTEMPT_SETTLE_MS } = {}) {
   const { captured, dispose } = await setupRequestCapture(page);
 
   const responsePromise = page
     .waitForResponse(checkoutResponseCandidate)
-    .then((r) => captureCheckoutFromResponse(r, page.url()))
+    .then((r) => captureCheckoutFromResponse(r, page.url(), target))
     .catch(() => null);
 
-  const { clicked } = await clickProCheckoutAction(page);
+  const { clicked } = await clickCheckoutAction(page, target);
 
   if (!clicked) {
     dispose();
@@ -624,7 +755,7 @@ async function captureFirstCheckoutAttempt(page, { attemptSettleMs = DEFAULT_ATT
 
   dispose();
 
-  const pageCheckout = await currentPageCheckoutUrl(page);
+  const pageCheckout = await currentPageCheckoutUrl(page, target);
   const recipe = buildRecipe(captured, pageCheckout);
 
   return { recipe, responseResult, pageCheckout };
@@ -663,6 +794,8 @@ export async function runFastClickCheckout({
   browserType = chromium,
   startAt,
   stopAt,
+  plan = 'pro',
+  billing = 'monthly_recurring',
   now = () => new Date(),
   sleep = defaultSleep,
   retryIntervalMs = 500,
@@ -670,11 +803,17 @@ export async function runFastClickCheckout({
   preStartRefreshMs = DEFAULT_PRE_START_REFRESH_MS,
   buttonPollMs = DEFAULT_BUTTON_POLL_MS,
   disabledRefreshMs = DEFAULT_DISABLED_REFRESH_MS,
+  busyRefreshMs = DEFAULT_BUSY_REFRESH_MS,
+  scheduledRestockPollMs = DEFAULT_SCHEDULED_RESTOCK_POLL_MS,
   maxAttempts = Infinity,
   output: logOutput = output,
   signal,
   onEvent
 } = {}) {
+  const target = {
+    plan: normalizePlan(plan),
+    billing: normalizeBilling(billing)
+  };
   const storageState = await ensureStorageState(browserType);
   const headless = process.env.GLM_HEADLESS === '1';
   const browser = await browserType.launch({ headless });
@@ -686,16 +825,22 @@ export async function runFastClickCheckout({
   let lastButtonState = null;
   let sawEnabledButton = false;
   let nextDisabledRefreshAt = 0;
+  let nextBusyRefreshAt = 0;
 
   try {
     onEvent?.({ type: 'preparing' });
     await page.goto(GLM_CODING_URL, { waitUntil: 'networkidle' });
 
     if (await pageRequiresLogin(page)) {
-      return failure(STATUSES.LOGIN_REQUIRED);
+      return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
     }
 
-    await chooseMonthlyIfPresent(page);
+    await chooseBillingIfPresent(page, target);
+    onEvent?.({
+      type: 'log',
+      message: `目标套餐: ${planLabel(target.plan)} / ${billingLabel(target.billing)}`,
+      level: 'info'
+    });
 
     if (startAt && now() < startAt) {
       const preRefreshAt = new Date(startAt.getTime() - Math.max(0, preStartRefreshMs));
@@ -716,7 +861,7 @@ export async function runFastClickCheckout({
           message: `开始前 ${preStartRefreshMs}ms 刷新页面，更新购买按钮状态`,
           level: 'info'
         });
-        await resetPageState(page);
+        await resetPageState(page, target);
       }
 
       await waitUntilWithCountdown({
@@ -741,7 +886,7 @@ export async function runFastClickCheckout({
       onEvent?.({ type: 'attempt', attempts });
 
       let result;
-      const pageCheckout = await currentPageCheckoutUrl(page);
+      const pageCheckout = await currentPageCheckoutUrl(page, target);
       if (pageCheckout) {
         result = pageCheckout;
       }
@@ -753,20 +898,76 @@ export async function runFastClickCheckout({
         }
       }
 
-      const buttonState = !result && !recipe ? await getProCheckoutActionState(page, { ensureMonthly: false }) : null;
+      const buttonState = !result && !recipe
+        ? await getCheckoutActionState(page, target, { ensureBilling: false, now: now() })
+        : null;
       if (buttonState?.found) {
         lastButtonState = buttonState;
         onEvent?.({
           type: 'log',
-          message: `购买按钮状态: disabled=${buttonState.disabled}, text="${buttonState.text}"`,
-          level: buttonState.disabled ? 'warn' : 'info'
+          message: `${planLabel(target.plan)} 卡片状态: cardState=${buttonState.cardState}, disabled=${buttonState.disabled}, text="${buttonState.text}"${buttonState.restockAt ? `, restockAt=${buttonState.restockAt.toISOString()}` : ''}`,
+          level: buttonState.cardState === 'available' ? 'info' : 'warn'
         });
-        if (!buttonState.disabled) {
+        if (buttonState.cardState === 'available') {
           sawEnabledButton = true;
         }
       }
 
-      if (!result && !recipe && buttonState?.found && buttonState.disabled) {
+      if (!result && !recipe && buttonState?.cardState === 'busy_retryable') {
+        lastStatus = 'busy_retryable';
+        const nowMs = now().getTime();
+        if (nowMs >= nextBusyRefreshAt) {
+          onEvent?.({
+            type: 'log',
+            message: '抢购人数过多，按提示刷新后继续重试',
+            level: 'warn'
+          });
+          await resetPageState(page, target);
+          nextBusyRefreshAt = now().getTime() + Math.max(0, busyRefreshMs);
+        }
+
+        const remainingMs = stopAt ? stopAt.getTime() - now().getTime() : buttonPollMs;
+        if (remainingMs <= 0) {
+          break;
+        }
+        await sleepWithAbort(Math.min(Math.max(1, buttonPollMs), remainingMs), { sleep, signal });
+        continue;
+      }
+
+      if (!result && !recipe && buttonState?.cardState === 'scheduled_restock') {
+        lastStatus = 'scheduled_restock';
+        const restockAt = buttonState.restockAt;
+        if (restockAt && stopAt && restockAt.getTime() > stopAt.getTime()) {
+          result = outOfStock({
+            ...targetPayload(target),
+            message: `Next restock is outside this retry window: ${formatLocalDateTime(restockAt)}.`,
+            restockAt: restockAt.toISOString()
+          });
+        } else if (restockAt && now().getTime() < restockAt.getTime()) {
+          const waitMs = Math.min(
+            Math.max(1, scheduledRestockPollMs),
+            restockAt.getTime() - now().getTime(),
+            stopAt ? Math.max(0, stopAt.getTime() - now().getTime()) : scheduledRestockPollMs
+          );
+          if (waitMs <= 0) {
+            break;
+          }
+          await sleepWithAbort(waitMs, { sleep, signal });
+          continue;
+        } else {
+          onEvent?.({
+            type: 'log',
+            message: '补货时间已到或未解析到补货时间，刷新页面重新读取目标套餐卡片状态',
+            level: 'warn'
+          });
+          await resetPageState(page, target);
+          await sleepWithAbort(Math.max(1, restockAt ? scheduledRestockPollMs : disabledRefreshMs), { sleep, signal });
+          continue;
+        }
+      }
+
+      if (!result && !recipe && buttonState?.found && buttonState.cardState === 'disabled') {
+        lastStatus = 'button_disabled';
         const nowMs = now().getTime();
         if (nowMs >= nextDisabledRefreshAt) {
           onEvent?.({
@@ -774,16 +975,11 @@ export async function runFastClickCheckout({
             message: '购买按钮仍不可用，刷新页面等待开放',
             level: 'warn'
           });
-          await resetPageState(page);
+          await resetPageState(page, target);
           nextDisabledRefreshAt = now().getTime() + Math.max(0, disabledRefreshMs);
 
           if (await pageRequiresLogin(page)) {
-            result = failure(STATUSES.LOGIN_REQUIRED);
-          } else {
-            const refreshedText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
-            if (classifyText(refreshedText) === 'out_of_stock') {
-              result = outOfStock();
-            }
+            result = failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
           }
         }
 
@@ -801,7 +997,7 @@ export async function runFastClickCheckout({
         if (shouldRefreshPage(attempts, recipe)) {
           logOutput.write('Refreshing page to reset state.\n');
           onEvent?.({ type: 'log', message: '刷新页面以重置状态，并刷新 token', level: 'info' });
-          await resetPageState(page);
+          await resetPageState(page, target);
           recipe = await refreshDynamicTokens(page, recipe);
         }
 
@@ -811,10 +1007,10 @@ export async function runFastClickCheckout({
         logOutput.write(`Replaying captured ${recipe.type} recipe.\n`);
         onEvent?.({ type: 'log', message: `重放 recipe: ${replayDetail}`, level: 'info' });
 
-        result = await attemptDiscoveredRecipe(page, recipe, onEvent);
+        result = await attemptDiscoveredRecipe(page, recipe, target, onEvent);
 
         if (!result) {
-          const pageCheckout = await currentPageCheckoutUrl(page);
+          const pageCheckout = await currentPageCheckoutUrl(page, target);
           if (pageCheckout) {
             onEvent?.({ type: 'log', message: `页面导航到 checkout URL: ${pageCheckout.checkoutUrl}`, level: 'info' });
             result = pageCheckout;
@@ -824,8 +1020,8 @@ export async function runFastClickCheckout({
         if (!result) {
           logOutput.write('Recipe replay failed, falling back to DOM click.\n');
           onEvent?.({ type: 'log', message: '重放未生成 checkout，重新扫描灰色按钮入口', level: 'warn' });
-          await resetPageState(page);
-          const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
+          await resetPageState(page, target);
+          const discovery = await discoverAndAttemptCheckoutRecipe(page, target, onEvent);
           if (discovery.recipe) {
             recipe = discovery.recipe;
           }
@@ -835,37 +1031,37 @@ export async function runFastClickCheckout({
           if (!result) {
             onEvent?.({ type: 'log', message: '灰色按钮入口仍未生成 checkout，降级为 DOM 点击重试', level: 'warn' });
             const { recipe: newRecipe, responseResult: rr, pageCheckout: pc } =
-              await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+              await captureFirstCheckoutAttempt(page, target, { attemptSettleMs });
             if (newRecipe) {
               recipe = newRecipe;
               onEvent?.({ type: 'log', message: `重新捕获到 recipe: ${newRecipe.type === 'api' ? `${newRecipe.method} ${newRecipe.url}` : `导航 ${newRecipe.url}`}`, level: 'info' });
             }
             result = pc || rr;
             if (!result) {
-              result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+              result = await attemptCheckoutOnPage(page, target, { attemptSettleMs });
             }
           }
         }
       }
 
       if (!result && !recipe) {
-        if (buttonState?.found && !buttonState.disabled) {
+        if (buttonState?.cardState === 'available') {
           onEvent?.({ type: 'log', message: '购买按钮已可用，立即点击并捕获 checkout API 请求', level: 'info' });
           const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
-            await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+            await captureFirstCheckoutAttempt(page, target, { attemptSettleMs });
           recipe = capturedRecipe;
-          result = pc || rr || await classifySettledPage(page);
+          result = pc || rr || await classifySettledPage(page, target);
         } else {
           logOutput.write('Capturing checkout request.\n');
           onEvent?.({ type: 'log', message: `第 ${attempts} 次尝试：扫描购买入口`, level: 'info' });
-          const discovery = await discoverAndAttemptCheckoutRecipe(page, onEvent);
+          const discovery = await discoverAndAttemptCheckoutRecipe(page, target, onEvent);
           recipe = discovery.recipe;
           result = discovery.result;
 
           if (!result) {
             onEvent?.({ type: 'log', message: '未从页面入口生成 checkout，首次点击并捕获 checkout API 请求', level: 'warn' });
             const { recipe: capturedRecipe, responseResult: rr, pageCheckout: pc } =
-              await captureFirstCheckoutAttempt(page, { attemptSettleMs });
+              await captureFirstCheckoutAttempt(page, target, { attemptSettleMs });
 
             recipe = recipe || capturedRecipe;
             result = pc || rr;
@@ -884,7 +1080,7 @@ export async function runFastClickCheckout({
           if (!result) {
             logOutput.write('No API captured, falling back to DOM click.\n');
             onEvent?.({ type: 'log', message: '降级为 DOM 点击重试', level: 'warn' });
-            result = await attemptCheckoutOnPage(page, { attemptSettleMs });
+            result = await attemptCheckoutOnPage(page, target, { attemptSettleMs });
           }
         }
       }
@@ -906,6 +1102,18 @@ export async function runFastClickCheckout({
           ...result,
           attempts
         };
+      }
+
+      if (result?.status === STATUSES.BUSY_RETRYABLE) {
+        lastStatus = STATUSES.BUSY_RETRYABLE;
+        onEvent?.({ type: 'log', message: '抢购人数过多，刷新页面后继续重试', level: 'warn' });
+        await resetPageState(page, target);
+        const remainingMs = stopAt ? stopAt.getTime() - now().getTime() : busyRefreshMs;
+        if (remainingMs <= 0) {
+          break;
+        }
+        await sleepWithAbort(Math.min(Math.max(1, busyRefreshMs), remainingMs), { sleep, signal });
+        continue;
       }
 
       if (result?.status === STATUSES.OUT_OF_STOCK) {
@@ -932,8 +1140,9 @@ export async function runFastClickCheckout({
       }
     }
 
-    if (!sawEnabledButton && lastButtonState?.disabled) {
+    if (!sawEnabledButton && lastButtonState?.cardState === 'disabled') {
       return failure(STATUSES.BUTTON_NEVER_ENABLED, {
+        ...targetPayload(target),
         message: stopAt
           ? `Retry window ended at ${formatLocalDateTime(stopAt)} while the purchase button stayed disabled.`
           : 'Purchase button stayed disabled before the retry loop ended.',
@@ -941,12 +1150,14 @@ export async function runFastClickCheckout({
         lastStatus,
         button: {
           disabled: lastButtonState.disabled,
-          text: lastButtonState.text
+          text: lastButtonState.text,
+          cardState: lastButtonState.cardState
         }
       });
     }
 
     return failure(STATUSES.CHECKOUT_NOT_CREATED, {
+      ...targetPayload(target),
       message: stopAt
         ? `Retry window ended at ${formatLocalDateTime(stopAt)} before checkout was created.`
         : 'Checkout was not created before the retry loop ended.',

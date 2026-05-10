@@ -21,6 +21,7 @@ test('extracts checkout URL and order ID from nested payloads', () => {
 
 test('classifies stock and login messages', () => {
   assert.equal(classifyText('Pro 连续包月 暂无库存'), 'out_of_stock');
+  assert.equal(classifyText('抢购人数过多，请刷新再试'), 'busy_retryable');
   assert.equal(classifyText('please login first'), 'login_required');
   assert.equal(classifyText('everything ok'), null);
 });

@@ -1,6 +1,7 @@
 import { DEFAULT_RETRY_INTERVAL_MS, nextCheckoutWindow } from './scheduler.js';
 import { runFastClickCheckout } from './browser-flow.js';
 import { createDailyJsonlLogger } from './file-logger.js';
+import { BILLING, normalizeBilling, normalizePlan, PLAN } from './constants.js';
 
 const WINDOW_DURATION_MS = 5 * 60 * 1000;
 
@@ -38,6 +39,8 @@ export class CheckoutTaskManager {
       status: 'idle',
       startAt: null,
       stopAt: null,
+      plan: PLAN,
+      billing: BILLING,
       retryIntervalMs: DEFAULT_RETRY_INTERVAL_MS,
       timeRemainingMs: 0,
       attempts: 0,
@@ -57,7 +60,7 @@ export class CheckoutTaskManager {
     return cloneStatus(this.status);
   }
 
-  start({ startAt, retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS } = {}) {
+  start({ startAt, plan = PLAN, billing = BILLING, retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS } = {}) {
     if (this.status.running || this.controller) {
       const error = new Error('Checkout task is already running.');
       error.code = 'TASK_ALREADY_RUNNING';
@@ -71,6 +74,8 @@ export class CheckoutTaskManager {
       throw error;
     }
 
+    const resolvedPlan = normalizePlan(plan);
+    const resolvedBilling = normalizeBilling(billing);
     const resolvedRetryIntervalMs = Number(retryIntervalMs);
     const safeRetryIntervalMs =
       Number.isFinite(resolvedRetryIntervalMs) && resolvedRetryIntervalMs > 0
@@ -85,6 +90,8 @@ export class CheckoutTaskManager {
       status: 'preparing',
       startAt: resolvedStartAt,
       stopAt,
+      plan: resolvedPlan,
+      billing: resolvedBilling,
       retryIntervalMs: safeRetryIntervalMs,
       timeRemainingMs: Math.max(0, resolvedStartAt.getTime() - this.now().getTime()),
       attempts: 0,
@@ -96,6 +103,8 @@ export class CheckoutTaskManager {
       data: {
         startAt: resolvedStartAt.toISOString(),
         stopAt: stopAt.toISOString(),
+        plan: resolvedPlan,
+        billing: resolvedBilling,
         retryIntervalMs: safeRetryIntervalMs
       }
     });
@@ -103,6 +112,8 @@ export class CheckoutTaskManager {
     const promise = this.runCheckout({
       startAt: resolvedStartAt,
       stopAt,
+      plan: resolvedPlan,
+      billing: resolvedBilling,
       retryIntervalMs: safeRetryIntervalMs,
       signal: controller.signal,
       now: this.now,

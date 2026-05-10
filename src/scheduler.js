@@ -2,6 +2,7 @@ import { stderr as defaultOutput } from 'node:process';
 import { runFastClickCheckout } from './browser-flow.js';
 import { createDailyJsonlLogger } from './file-logger.js';
 import { formatLocalDateTime } from './time.js';
+import { BILLING, normalizeBilling, normalizePlan, PLAN } from './constants.js';
 
 export const DEFAULT_RETRY_INTERVAL_MS = 500;
 export const WINDOW_START = Object.freeze({ hour: 10, minute: 0 });
@@ -38,12 +39,16 @@ export async function runScheduledCheckout({
   runCheckout = runFastClickCheckout,
   now = () => new Date(),
   output = defaultOutput,
+  plan = PLAN,
+  billing = BILLING,
   retryIntervalMs = parseRetryIntervalMs(process.env.GLM_RETRY_INTERVAL_MS),
   createLogger = createDailyJsonlLogger,
   onEvent
 } = {}) {
   const base = now();
   const { startAt, stopAt } = nextCheckoutWindow(base);
+  const resolvedPlan = normalizePlan(plan);
+  const resolvedBilling = normalizeBilling(billing);
   const logger = createLogger({ now });
   const pendingWrites = [];
 
@@ -120,6 +125,8 @@ export async function runScheduledCheckout({
     data: {
       startAt: startAt.toISOString(),
       stopAt: stopAt.toISOString(),
+      plan: resolvedPlan,
+      billing: resolvedBilling,
       retryIntervalMs
     }
   });
@@ -128,6 +135,8 @@ export async function runScheduledCheckout({
     const result = await runCheckout({
       startAt,
       stopAt,
+      plan: resolvedPlan,
+      billing: resolvedBilling,
       now,
       output,
       retryIntervalMs,

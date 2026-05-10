@@ -1,6 +1,7 @@
 import { absolutizeUrl, looksLikeCheckoutUrl } from './url.js';
 
 const ORDER_ID_KEYS = /(^|_)(order|trade|purchase)(_|-)?id$/i;
+const BUSY_RETRYABLE_RE = /(抢购人数过多|刷新再试|稍后再试|too\s*many|try\s*again|busy)/i;
 const OUT_OF_STOCK_RE = /(库存不足|售罄|暂无库存|已抢光|sold\s*out|out\s*of\s*stock|not\s*available)/i;
 const LOGIN_REQUIRED_RE = /(登录|登陆|login|unauthorized|未授权|not\s*authenticated)/i;
 
@@ -55,6 +56,10 @@ export function extractCheckoutCandidate(payload, baseUrl) {
 export function classifyText(text) {
   if (!text) {
     return null;
+  }
+
+  if (BUSY_RETRYABLE_RE.test(text)) {
+    return 'busy_retryable';
   }
 
   if (OUT_OF_STOCK_RE.test(text)) {
