@@ -36,6 +36,7 @@ export const DEFAULT_PRE_START_REFRESH_MS = 3000;
 export const DEFAULT_BUTTON_POLL_MS = 100;
 export const DEFAULT_DISABLED_REFRESH_MS = 800;
 export const DEFAULT_BUSY_REFRESH_MS = 500;
+export const DEFAULT_OUT_OF_STOCK_REFRESH_MS = 500;
 export const DEFAULT_SCHEDULED_RESTOCK_POLL_MS = 100;
 
 async function fileExists(path) {
@@ -97,11 +98,15 @@ function targetPayload(target) {
 async function captureCheckoutFromResponse(response, pageUrl, target) {
   const body = await responseToJsonOrText(response);
   const text = typeof body === 'string' ? body : JSON.stringify(body);
-  const status = classifyText(text);
 
-  if (status === 'out_of_stock') {
-    return outOfStock(targetPayload(target));
+  if (body && typeof body === 'object') {
+    const candidate = extractCheckoutCandidate(body, pageUrl);
+    if (candidate.checkoutUrl) {
+      return checkoutReady({ ...candidate, ...targetPayload(target) });
+    }
   }
+
+  const status = classifyText(text);
 
   if (status === 'busy_retryable') {
     return failure(STATUSES.BUSY_RETRYABLE, targetPayload(target));
@@ -111,11 +116,8 @@ async function captureCheckoutFromResponse(response, pageUrl, target) {
     return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
-  if (body && typeof body === 'object') {
-    const candidate = extractCheckoutCandidate(body, pageUrl);
-    if (candidate.checkoutUrl) {
-      return checkoutReady({ ...candidate, ...targetPayload(target) });
-    }
+  if (status === 'out_of_stock') {
+    return outOfStock(targetPayload(target));
   }
 
   return null;
@@ -557,12 +559,15 @@ async function attemptDiscoveredRecipe(page, recipe, target, onEvent) {
     level: replayResult.ok ? 'info' : 'warn'
   });
 
-  const textStatus = classifyText(bodyText);
-  if (textStatus === 'out_of_stock') {
-    onEvent?.({ type: 'log', message: '服务端返回库存不足/未开放', level: 'warn' });
-    return outOfStock(targetPayload(target));
+  if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
+    const candidate = extractCheckoutCandidate(replayResult.body, page.url());
+    if (candidate.checkoutUrl) {
+      onEvent?.({ type: 'log', message: `成功解析 checkoutUrl: ${candidate.checkoutUrl}`, level: 'info' });
+      return checkoutReady({ ...candidate, ...targetPayload(target) });
+    }
   }
 
+  const textStatus = classifyText(bodyText);
   if (textStatus === 'busy_retryable') {
     onEvent?.({ type: 'log', message: '服务端返回抢购人数过多，需要刷新重试', level: 'warn' });
     return failure(STATUSES.BUSY_RETRYABLE, targetPayload(target));
@@ -573,12 +578,9 @@ async function attemptDiscoveredRecipe(page, recipe, target, onEvent) {
     return failure(STATUSES.LOGIN_REQUIRED, targetPayload(target));
   }
 
-  if (replayResult.ok && replayResult.body && typeof replayResult.body === 'object') {
-    const candidate = extractCheckoutCandidate(replayResult.body, page.url());
-    if (candidate.checkoutUrl) {
-      onEvent?.({ type: 'log', message: `成功解析 checkoutUrl: ${candidate.checkoutUrl}`, level: 'info' });
-      return checkoutReady({ ...candidate, ...targetPayload(target) });
-    }
+  if (textStatus === 'out_of_stock') {
+    onEvent?.({ type: 'log', message: '服务端返回库存不足/未开放', level: 'warn' });
+    return outOfStock(targetPayload(target));
   }
 
   const pageCheckout = await currentPageCheckoutUrl(page, target);
@@ -689,6 +691,19 @@ function abortError() {
   const error = new Error('Checkout task was stopped.');
   error.name = 'AbortError';
   return error;
+}
+
+export function retryDelayBeforeStop({ now, stopAt, intervalMs }) {
+  if (!stopAt) {
+    return null;
+  }
+
+  const remainingMs = stopAt.getTime() - now.getTime();
+  if (remainingMs <= 0) {
+    return null;
+  }
+
+  return Math.min(Math.max(1, intervalMs), remainingMs);
 }
 
 async function sleepWithAbort(ms, { sleep, signal } = {}) {
@@ -804,6 +819,7 @@ export async function runFastClickCheckout({
   buttonPollMs = DEFAULT_BUTTON_POLL_MS,
   disabledRefreshMs = DEFAULT_DISABLED_REFRESH_MS,
   busyRefreshMs = DEFAULT_BUSY_REFRESH_MS,
+  outOfStockRefreshMs = DEFAULT_OUT_OF_STOCK_REFRESH_MS,
   scheduledRestockPollMs = DEFAULT_SCHEDULED_RESTOCK_POLL_MS,
   maxAttempts = Infinity,
   output: logOutput = output,
@@ -822,6 +838,7 @@ export async function runFastClickCheckout({
   const passiveCapture = installPassiveCheckoutRequestCapture(page, onEvent);
   let attempts = 0;
   let lastStatus;
+  let lastOutOfStockResult = null;
   let lastButtonState = null;
   let sawEnabledButton = false;
   let nextDisabledRefreshAt = 0;
@@ -1117,11 +1134,38 @@ export async function runFastClickCheckout({
       }
 
       if (result?.status === STATUSES.OUT_OF_STOCK) {
-        onEvent?.({ type: 'log', message: '服务端确认库存不足/未开放', level: 'warn' });
-        return {
-          ...result,
-          attempts
-        };
+        lastOutOfStockResult = result;
+        lastStatus = STATUSES.OUT_OF_STOCK;
+        if (attempts >= maxAttempts) {
+          onEvent?.({ type: 'log', message: '服务端确认库存不足/未开放，已达到最大尝试次数', level: 'warn' });
+          return {
+            ...result,
+            attempts
+          };
+        }
+
+        const retryDelayMs = retryDelayBeforeStop({
+          now: now(),
+          stopAt,
+          intervalMs: outOfStockRefreshMs
+        });
+
+        if (retryDelayMs == null) {
+          onEvent?.({ type: 'log', message: '服务端确认库存不足/未开放，重试窗口已结束', level: 'warn' });
+          return {
+            ...result,
+            attempts
+          };
+        }
+
+        onEvent?.({
+          type: 'log',
+          message: '服务端暂报库存不足/未开放，窗口内继续刷新重试',
+          level: 'warn'
+        });
+        await resetPageState(page, target);
+        await sleepWithAbort(retryDelayMs, { sleep, signal });
+        continue;
       }
 
       if (attempts >= maxAttempts) {
@@ -1153,6 +1197,17 @@ export async function runFastClickCheckout({
           text: lastButtonState.text,
           cardState: lastButtonState.cardState
         }
+      });
+    }
+
+    if (lastOutOfStockResult) {
+      return outOfStock({
+        ...targetPayload(target),
+        message: stopAt
+          ? `Retry window ended at ${formatLocalDateTime(stopAt)} while the server still reported out of stock or not open.`
+          : 'The server reported out of stock or not open before checkout was created.',
+        attempts,
+        lastStatus
       });
     }
 

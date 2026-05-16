@@ -3,7 +3,7 @@ import { runFastClickCheckout } from './browser-flow.js';
 import { createDailyJsonlLogger } from './file-logger.js';
 import { BILLING, normalizeBilling, normalizePlan, PLAN } from './constants.js';
 
-const WINDOW_DURATION_MS = 5 * 60 * 1000;
+const WINDOW_DURATION_MS = 15 * 60 * 1000;
 
 function stoppedResult() {
   return {

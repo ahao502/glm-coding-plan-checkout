@@ -17,9 +17,9 @@ test('computes default start time as the next 10:00 window', () => {
   assert.equal(defaultStartAt(new Date(2026, 0, 1, 14, 50)).toISOString(), new Date(2026, 0, 2, 10, 0).toISOString());
 });
 
-test('sets stop time to five minutes after start', () => {
+test('sets stop time to fifteen minutes after start', () => {
   const startAt = new Date(2026, 0, 1, 10, 0);
-  assert.equal(stopAtForStart(startAt).toISOString(), new Date(2026, 0, 1, 10, 5).toISOString());
+  assert.equal(stopAtForStart(startAt).toISOString(), new Date(2026, 0, 1, 10, 15).toISOString());
 });
 
 test('rejects a second concurrent checkout task', async () => {

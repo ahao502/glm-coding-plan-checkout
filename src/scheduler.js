@@ -6,7 +6,7 @@ import { BILLING, normalizeBilling, normalizePlan, PLAN } from './constants.js';
 
 export const DEFAULT_RETRY_INTERVAL_MS = 500;
 export const WINDOW_START = Object.freeze({ hour: 10, minute: 0 });
-export const WINDOW_STOP = Object.freeze({ hour: 10, minute: 5 });
+export const WINDOW_STOP = Object.freeze({ hour: 10, minute: 15 });
 
 function localTodayAt(now, { hour, minute }) {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);

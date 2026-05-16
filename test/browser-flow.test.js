@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyProCardText, selectCheckoutActionState, selectProCheckoutActionState } from '../src/browser-flow.js';
+import {
+  classifyProCardText,
+  retryDelayBeforeStop,
+  selectCheckoutActionState,
+  selectProCheckoutActionState
+} from '../src/browser-flow.js';
 
 const NOW = new Date(2026, 4, 10, 10, 0, 0);
 
@@ -158,4 +163,39 @@ test('selects the configured plan card by plan depth', () => {
 
   assert.equal(state.fingerprint, 'max-card');
   assert.equal(state.cardState, 'available');
+});
+
+test('keeps retrying out-of-stock responses inside the retry window', () => {
+  const stopAt = new Date(2026, 4, 16, 10, 15, 0);
+
+  assert.equal(
+    retryDelayBeforeStop({
+      now: new Date(2026, 4, 16, 10, 0, 17),
+      stopAt,
+      intervalMs: 500
+    }),
+    500
+  );
+
+  assert.equal(
+    retryDelayBeforeStop({
+      now: new Date(2026, 4, 16, 10, 14, 59, 800),
+      stopAt,
+      intervalMs: 500
+    }),
+    200
+  );
+});
+
+test('stops retrying out-of-stock responses after the retry window', () => {
+  const stopAt = new Date(2026, 4, 16, 10, 15, 0);
+
+  assert.equal(
+    retryDelayBeforeStop({
+      now: stopAt,
+      stopAt,
+      intervalMs: 500
+    }),
+    null
+  );
 });
